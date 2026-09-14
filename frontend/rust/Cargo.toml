@@ -1,0 +1,19 @@
+[package]
+name = "rust_lib_frontend"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+flutter_rust_bridge = "=2.12.0"
+csqtt-core = { path = "../../backend" }
+anyhow = "1.0"
+tokio-util = "0.7.19"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }
+
+[patch.crates-io]
+primp = { path = "../../backend/vendor/primp" }

@@ -1,0 +1,8 @@
+# Isar/FRB кодогенерация: isar_generator использует анализатор, который
+# не парсит extension types в сгенерированном FRB веб-варианте моста.
+# В Windows-сборке этот файл не участвует — исключаем из источников.
+targets:
+  $default:
+    sources:
+      exclude:
+        - lib/src/rust/frb_generated.web.dart

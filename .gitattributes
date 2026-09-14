@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: 2026 amurcanov
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+# Дистрибутивные shell-скрипты (linux/focsq.sh, tools/*): CRLF ломает их
+# shebang (`#!/bin/bash\r` не найден), а .gitattributes c eol=lf держит
+# рабочую копию LF даже при core.autocrlf=true на Windows-машинах.
+*.sh text eol=lf
+*.desktop text eol=lf

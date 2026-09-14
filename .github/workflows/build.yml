@@ -1,0 +1,280 @@
+# SPDX-FileCopyrightText: 2026 amurcanov
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+#
+# Сборка FOCSQ на GitHub Actions.
+#
+#   windows: ядро (cargo check + тесты) + flutter build windows → zip-артефакт
+#   linux:   ядро (первая реальная компиляция tun_linux.rs — netlink/ioctl
+#            писались вслепую с Windows-машины) + analyze/test фронтенда
+#            + flutter build linux → tar-артефакт
+#
+# Пины версий повторяют среду разработки:
+#   Rust    1.97.1  (rust-version из backend/Cargo.toml)
+#   Flutter 3.44.9  (локальная stable-установка, Dart 3.12.2)
+#
+# Linux-платформа Flutter (frontend/linux) сгенерирована и лежит в
+# репозитории, как windows/: бинарник «focsq», окно «FOCSQ».
+
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Windows x64 — ядро + GUI
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust 1.97.1
+        run: |
+          rustup set profile minimal
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup default 1.97.1
+
+      - name: Кэш Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            backend/target
+          key: cargo-windows-${{ hashFiles('backend/Cargo.lock') }}
+          restore-keys: cargo-windows-
+
+      - name: Ядро — компиляция
+        working-directory: backend
+        run: cargo check --all-targets --locked
+
+      - name: Ядро — тесты
+        working-directory: backend
+        run: cargo test --lib --locked
+
+      - name: Flutter 3.44.9
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.9'
+          channel: stable
+
+      - name: Зависимости фронтенда
+        working-directory: frontend
+        run: flutter pub get
+
+      # cargokit (rust_builder) сам собирает cdylib ядра (cargo build --release)
+      - name: Сборка GUI (release)
+        working-directory: frontend
+        run: flutter build windows --release
+
+      # flutter build не кладёт VC++ Runtime рядом с exe (динамический CRT),
+      # а приложение без него не запустится на чистой Windows. Копируем из
+      # System32 раннера (VC++ 2022 Runtime предустановлен) — то же самое
+      # делает copy_redist_dlls в локальном make-инструменте. Шаг стоит до
+      # zip и установщика, чтобы и портативный архив, и Setup.exe содержали
+      # DLL. wintun.dll не трогаем: приложение распаковывает её само из
+      # ассетов в %LOCALAPPDATA%\FOCSQ.
+      - name: VC++ Runtime в Release
+        run: |
+          release='frontend/build/windows/x64/runner/Release'
+          for dll in vcruntime140.dll vcruntime140_1.dll msvcp140.dll msvcp140_1.dll msvcp140_2.dll; do
+            cp "/c/Windows/System32/$dll" "$release/"
+            echo "  + $dll"
+          done
+
+      - name: ZIP-артефакт
+        shell: pwsh
+        run: |
+          $release = 'frontend/build/windows/x64/runner/Release'
+          if (-not (Test-Path "$release/focsq.exe")) { throw 'focsq.exe не найден в Release' }
+          Compress-Archive -Path "$release/*" -DestinationPath focsq-windows-x64.zip -Force
+          Get-Item focsq-windows-x64.zip | Format-List Name,Length
+
+      - name: Публикация артефакта
+        uses: actions/upload-artifact@v4
+        with:
+          name: focsq-windows-x64
+          path: focsq-windows-x64.zip
+          if-no-files-found: error
+
+      # Inno Setup 6 предустановлен на образе. Версия установщика — из
+      # pubspec (1.2.3+4 → 1.2.3), iss принимает её через -DAppVersion
+      # (дефис, а не слэш: bash-раннер — это Git Bash, MSYS конвертирует
+      # /D-опции в пути). wintun.dll в Release не кладём — приложение
+      # распаковывает её из ассетов само.
+      - name: Установщик (Inno Setup)
+        working-directory: frontend
+        run: |
+          VERSION=$(sed -n 's/^version:[[:space:]]*//p' pubspec.yaml | head -1 | cut -d'+' -f1)
+          ISCC=''
+          for p in "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" \
+                   "/c/Program Files/Inno Setup 6/ISCC.exe"; do
+            [ -f "$p" ] && ISCC="$p" && break
+          done
+          [ -z "$ISCC" ] && ISCC=ISCC.exe
+          echo "ISCC: $ISCC, AppVersion: $VERSION"
+          "$ISCC" "-DAppVersion=$VERSION" tools/focsq_setup.iss
+          test -f build/FOCSQ-Setup.exe
+          ls -lh build/FOCSQ-Setup.exe
+
+      - name: Публикация установщика
+        uses: actions/upload-artifact@v4
+        with:
+          name: focsq-windows-setup
+          path: frontend/build/FOCSQ-Setup.exe
+          if-no-files-found: error
+
+  linux:
+    name: Linux x64 — ядро + GUI
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # GTK — Flutter-desktop; webkit2gtk — desktop_webview_window (VK-логин);
+      # libsecret — flutter_secure_storage; ayatana-appindicator — tray_manager.
+      - name: Системные зависимости
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang cmake ninja-build pkg-config \
+            libgtk-3-dev liblzma-dev \
+            libwebkit2gtk-4.1-dev \
+            libsecret-1-dev \
+            libayatana-appindicator3-dev
+
+      - name: Rust 1.97.1
+        run: |
+          rustup set profile minimal
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup default 1.97.1
+
+      - name: Кэш Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            backend/target
+          key: cargo-linux-${{ hashFiles('backend/Cargo.lock') }}
+          restore-keys: cargo-linux-
+
+      # Падение этого шага и есть результат проверки вслепую написанного
+      # netlink/ioctl-кода из tun_linux.rs — на Windows-машине он не
+      # компилировался никогда.
+      - name: Ядро — компиляция
+        working-directory: backend
+        run: cargo check --all-targets --locked
+
+      - name: Ядро — тесты
+        working-directory: backend
+        run: cargo test --lib --locked
+
+      - name: Flutter 3.44.9
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.9'
+          channel: stable
+
+      - name: Зависимости фронтенда
+        working-directory: frontend
+        run: flutter pub get
+
+      - name: Анализатор
+        working-directory: frontend
+        # --no-fatal-infos: в коде есть 3 старых info-замечания
+        # (имена файлов в lib/modals, print в check_enc.dart);
+        # ошибки и предупреждения остаются фатальными
+        run: flutter analyze --no-fatal-infos
+
+      - name: Тесты фронтенда
+        working-directory: frontend
+        run: flutter test
+
+      - name: Сборка GUI (release)
+        working-directory: frontend
+        run: flutter build linux --release
+
+      # tar, а не zip: exec-бит бинарника должен сохраниться при распаковке
+      - name: tar-артефакт
+        run: |
+          tar -czf focsq-linux-x64.tar.gz -C frontend/build/linux/x64/release/bundle .
+          ls -lh focsq-linux-x64.tar.gz
+
+      - name: Публикация артефакта
+        uses: actions/upload-artifact@v4
+        with:
+          name: focsq-linux-x64
+          path: focsq-linux-x64.tar.gz
+          if-no-files-found: error
+
+  # Тег v* → Release на GitHub с вложениями-сборками. Приложение
+  # проверяет /releases/latest (UpdateService) — Draft/pre-release
+  # игнорируются API.
+  release:
+    name: Release на GitHub
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Полная история — для списка коммитов с прошлого тега
+          fetch-depth: 0
+
+      - name: Скачивание сборок
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Примечания к релизу (коммиты с прошлого тега)
+        id: notes
+        run: |
+          PREV_TAG=$(git tag --sort=-v:refname | grep -v "^${GITHUB_REF_NAME}$" | head -1 || true)
+          RANGE="${PREV_TAG:+$PREV_TAG..}$GITHUB_REF_NAME"
+          {
+            if [ -n "$PREV_TAG" ]; then
+              echo "Изменения с $PREV_TAG:"
+            else
+              echo "Первый релиз."
+            fi
+            git log --format='- %s (%h)' "$RANGE" 2>/dev/null | head -60 || true
+            echo
+            echo '## Установка'
+            echo '- **Windows**: `FOCSQ-Setup.exe` — установщик (Inno Setup). Альтернатива без установки: распаковать `focsq-windows-x64.zip`, запустить `focsq.exe`.'
+            echo '- **Linux**: распаковать `focsq-linux-x64.tar.gz`, запустить `focsq.sh` (он сам поставит зависимости, выдаст cap_net_admin через focsq-tun и запустит приложение).'
+          } > notes.md
+
+      # gh на ubuntu-runner предустановлен и аутентифицирован через
+      # GITHUB_TOKEN (permissions: contents: write выше).
+      - name: Создание Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -lh dist/
+          # Пересборка релиза: старый v1.0.0 (без Setup.exe и с багом 740)
+          # удаляем целиком и создаём заново на свежих артефактах.
+          gh release delete "$GITHUB_REF_NAME" --yes 2>/dev/null || true
+          gh release create "$GITHUB_REF_NAME" \
+            --title "FOCSQ $GITHUB_REF_NAME" \
+            --notes-file notes.md \
+            dist/focsq-windows-x64.zip \
+            dist/focsq-linux-x64.tar.gz \
+            dist/FOCSQ-Setup.exe
