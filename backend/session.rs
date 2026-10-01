@@ -1162,7 +1162,17 @@ async fn reader_loop(
         // сервера (например, однобайтовый 0xFF) не распознаны выше и
         // ядро отвергло бы их записью EINVAL, что раньше убивало задачу
         // записи TUN навсегда — туннель «зависал» без трафика.
-        if !is_ip_packet(packet.as_slice()) {
+        //
+        // TCP-downlink приходит в туннельном фрейме CQF1 (24 байта,
+        // shared/flow_frame.rs), который снимается только позже — в
+        // ReturnReorder::push. Сырой фрейм начинается с 'C' (0x43 →
+        // IHL = 3) и is_ip_packet его отвергает, поэтому проверяется
+        // payload фрейма. payload() не трогает байты без magic CQF1,
+        // так что служебные ответы и некадрированные пакеты (UDP)
+        // ведут себя как раньше; сам пакет для ReturnReorder остаётся
+        // нетронутым — фрейм нужен там для reorder'а.
+        let payload = crate::flow_frame::payload(packet.as_slice());
+        if !is_ip_packet(payload) {
             dropped_non_ip += 1;
             if dropped_non_ip <= 8 || dropped_non_ip.is_multiple_of(1000) {
                 crate::log_error!(
@@ -1170,7 +1180,7 @@ async fn reader_loop(
                      первый байт 0x{:02X}",
                     dropped_non_ip,
                     packet.len(),
-                    packet.as_slice().first().copied().unwrap_or_default()
+                    payload.first().copied().unwrap_or_default()
                 );
             }
             continue;
@@ -1190,12 +1200,16 @@ fn deliver_inbound_packet(dispatcher: &Dispatcher, packet: PacketBuf) {
     dispatcher.return_packet(packet);
 }
 
-/// [FOCSQ] Пакет из канала данных пригоден для записи в TUN-интерфейс.
+/// [FOCSQ] Пакет (или payload туннельного фрейма) пригоден для записи в TUN.
 ///
 /// Ядро Linux принимает в TUN только валидные пакеты IPv4/IPv6; всё прочее
 /// (служебные однобайтовые ответы сервера, усечённые или мусорные датаграммы)
 /// запись отвергает с `EINVAL`. Раньше такая запись убивала задачу записи TUN
 /// навсегда, поэтому непригодные пакеты отбрасываются ещё в reader_loop.
+///
+/// Важно: вызывать на `flow_frame::payload(...)`, а не на сырых байтах —
+/// TCP-downlink приходит в фрейме CQF1 (24 байта), чей первый байт
+/// `'C'` (0x43) читается как IPv4 с IHL = 3 и провалил бы проверку.
 fn is_ip_packet(packet: &[u8]) -> bool {
     match packet.first().map(|byte| byte >> 4) {
         Some(4) => {
@@ -2069,5 +2083,39 @@ mod tests {
         let mut ipv6 = vec![0u8; 39];
         ipv6[0] = 0x60;
         assert!(!is_ip_packet(&ipv6));
+    }
+
+    #[test]
+    fn ip_filter_accepts_tcp_packets_inside_flow_frame() {
+        // TCP-downlink приходит в туннельном фрейме CQF1 (24 байта):
+        // magic + sender_id + flow_id + sequence. Сырой фрейм начинается
+        // с 'C' (0x43 → IHL=3 → header_len=12 < 20) и отвергался бы,
+        // поэтому reader_loop проверяет payload после заголовка.
+        let mut framed = vec![0u8; 24 + 60];
+        framed[..4].copy_from_slice(b"CQF1");
+        framed[24] = 0x45; // IPv4 внутри фрейма
+        assert!(is_ip_packet(crate::flow_frame::payload(&framed)));
+
+        // IPv6 внутри фрейма
+        framed[24] = 0x60;
+        assert!(is_ip_packet(crate::flow_frame::payload(&framed)));
+
+        // Мусор внутри фрейма — отбрасывается
+        framed[24] = 0x55;
+        assert!(!is_ip_packet(crate::flow_frame::payload(&framed)));
+
+        // Payload короче минимального IP-заголовка — отбрасывается
+        let mut framed = vec![0u8; 24 + 4];
+        framed[..4].copy_from_slice(b"CQF1");
+        framed[24] = 0x45;
+        assert!(!is_ip_packet(crate::flow_frame::payload(&framed)));
+
+        // Пакет без magic CQF1 payload() возвращает без изменений:
+        // служебные ответы и UDP не затрагиваются
+        assert!(!is_ip_packet(crate::flow_frame::payload(&[0xff])));
+        assert!(
+            is_ip_packet(crate::flow_frame::payload(&[0x45; 60])),
+            "некадрированный IPv4 должен проверяться как есть"
+        );
     }
 }
