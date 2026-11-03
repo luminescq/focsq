@@ -62,9 +62,7 @@ class _MainLayoutState extends State<MainLayout> with WindowListener {
   @override
   void dispose() {
     windowManager.removeListener(this);
-    if (ConnectService().state != ConnectState.disconnected) {
-      ConnectService().stop();
-    }
+    unawaited(ConnectService().stop());
     super.dispose();
   }
 
@@ -80,13 +78,12 @@ class _MainLayoutState extends State<MainLayout> with WindowListener {
       return;
     }
     await windowManager.hide();
-    if (ConnectService().state != ConnectState.disconnected) {
-      await ConnectService().stop();
-    }
+    await ConnectService().stop();
     await ConnectService().waitForExit();
     LogService().add(
       '[КОННЕКТ] Закрытие окна: destroy (${sw.elapsedMilliseconds}мс)',
     );
+    await LogService().closeDiagnosticOutput();
     await windowManager.destroy();
   }
 

@@ -22,8 +22,6 @@ use crate::{
 };
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
-#[cfg(test)]
-use std::time::Instant;
 use std::{
     collections::VecDeque,
     net::SocketAddr,
@@ -31,7 +29,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -159,6 +157,9 @@ struct TransportReader {
     shared: Arc<TransportShared>,
     receiver: TurnReceiver,
     replay: ReplayProtection,
+    diagnostics: ReceiveDiagnostics,
+    worker_id: usize,
+    rejection_samples: u8,
 }
 
 enum WriterCommand {
@@ -252,7 +253,7 @@ impl ShutdownCoordinator {
         activity.store(self.next_activity(), Ordering::Release);
     }
 
-    async fn request_disconnect(&self, device_id: &str, salt: &str) {
+    async fn request_disconnect(&self, password: &str, salt: &str) {
         let leader = {
             let mut state = self.lock_state();
             if state.active {
@@ -268,7 +269,7 @@ impl ShutdownCoordinator {
             return;
         }
 
-        let request = disconnect_request(device_id, salt);
+        let request = disconnect_request(password, salt);
         for writer in self
             .control_streams()
             .into_iter()
@@ -454,16 +455,342 @@ impl ReplayWindow {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ReceiveDiagnostics {
+    datagrams: u64,
+    wire_bytes: u64,
+    decrypted: u64,
+    accepted: u64,
+    non_rtp: u64,
+    decrypt_errors: u64,
+    auth_failed: u64,
+    malformed_rtp: u64,
+    replay_drops: u64,
+}
+
+impl ReceiveDiagnostics {
+    fn since(self, previous: Self) -> Self {
+        Self {
+            datagrams: self.datagrams.saturating_sub(previous.datagrams),
+            wire_bytes: self.wire_bytes.saturating_sub(previous.wire_bytes),
+            decrypted: self.decrypted.saturating_sub(previous.decrypted),
+            accepted: self.accepted.saturating_sub(previous.accepted),
+            non_rtp: self.non_rtp.saturating_sub(previous.non_rtp),
+            decrypt_errors: self.decrypt_errors.saturating_sub(previous.decrypt_errors),
+            auth_failed: self.auth_failed.saturating_sub(previous.auth_failed),
+            malformed_rtp: self.malformed_rtp.saturating_sub(previous.malformed_rtp),
+            replay_drops: self.replay_drops.saturating_sub(previous.replay_drops),
+        }
+    }
+
+    fn summary(self) -> String {
+        format!(
+            "turn_payloads={} wire_bytes={} decrypted={} accepted={} non_rtp={} decrypt_errors={} auth_failed={} malformed_rtp={} replay_drops={}",
+            self.datagrams,
+            self.wire_bytes,
+            self.decrypted,
+            self.accepted,
+            self.non_rtp,
+            self.decrypt_errors,
+            self.auth_failed,
+            self.malformed_rtp,
+            self.replay_drops,
+        )
+    }
+
+    fn timeout_kind(self) -> &'static str {
+        if self.datagrams == 0 {
+            "no_turn_payload"
+        } else if self.accepted != 0 {
+            "no_configuration_reply"
+        } else if self.auth_failed != 0 {
+            "authentication_failed"
+        } else if self.malformed_rtp != 0 {
+            "malformed_rtp"
+        } else if self.non_rtp != 0 {
+            "unsupported_packet_format"
+        } else {
+            "replayed_packets_only"
+        }
+    }
+
+    fn timeout_hint(self) -> &'static str {
+        match self.timeout_kind() {
+            "no_turn_payload" => {
+                "TURN ChannelBind выполнен, но ответные данные от пира не получены; проверьте UDP-порт сервера, firewall и маршрут TURN → сервер"
+            }
+            "authentication_failed" => {
+                "ответные данные получены, но аутентификация не прошла; сравните протокол клиента/сервера и пароль подключения"
+            }
+            "malformed_rtp" => {
+                "получены некорректные RTP-пакеты; проверьте формат протокола клиента/сервера и журнал сервера"
+            }
+            "no_configuration_reply" => {
+                "ответные данные расшифрованы, но конфигурационного ответа нет; проверьте журнал сервера"
+            }
+            "unsupported_packet_format" => {
+                "TURN доставил данные неподдерживаемого формата; проверьте адрес/порт сервера и выбранный транспорт"
+            }
+            _ => {
+                "получены только повторные данные; проверьте журнал сервера и состояние текущей сессии"
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InboundResult {
+    NonRtp,
+    AuthFailed,
+    MalformedRtp(RtpRejectKind),
+    ReplayDrop,
+    Accepted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RtpRejectKind {
+    UnsupportedPt,
+    TruncatedCsrc,
+    TruncatedExtension,
+    MissingTag,
+    InvalidPadding,
+    Other,
+}
+
+impl RtpRejectKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::UnsupportedPt => "unsupported_pt",
+            Self::TruncatedCsrc => "truncated_csrc",
+            Self::TruncatedExtension => "truncated_extension",
+            Self::MissingTag => "missing_tag",
+            Self::InvalidPadding => "invalid_padding",
+            Self::Other => "other",
+        }
+    }
+
+    fn hmac_status(self) -> &'static str {
+        match self {
+            // ObfsCipher checks HMAC and decrypts before validating padding.
+            Self::InvalidPadding => "verified",
+            Self::Other => "unknown",
+            _ => "not_checked",
+        }
+    }
+}
+
+fn rtp_reject_kind(error: &anyhow::Error) -> RtpRejectKind {
+    error
+        .chain()
+        .find_map(|cause| {
+            let message = cause.to_string();
+            if message.starts_with("obfs: unsupported payload type ") {
+                Some(RtpRejectKind::UnsupportedPt)
+            } else if message == "obfs: packet too short for RTP CSRCs" {
+                Some(RtpRejectKind::TruncatedCsrc)
+            } else if message == "obfs: packet too short for extension header" {
+                Some(RtpRejectKind::TruncatedExtension)
+            } else if message == "obfs srtp: missing payload or authentication tag" {
+                Some(RtpRejectKind::MissingTag)
+            } else if message.starts_with("obfs srtp: invalid padding length ") {
+                Some(RtpRejectKind::InvalidPadding)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(RtpRejectKind::Other)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RtpHeaderDiagnostics {
+    wire_len: usize,
+    version: Option<u8>,
+    payload_type: Option<u8>,
+    padding: Option<bool>,
+    extension: Option<bool>,
+    csrc_count: Option<u8>,
+    base_header_len: Option<usize>,
+    header_len: Option<usize>,
+    extension_words: Option<u16>,
+}
+
+impl RtpHeaderDiagnostics {
+    fn from_wire(wire: &[u8]) -> Self {
+        let first = wire.first().copied();
+        let extension = first.map(|value| value & 0x10 != 0);
+        let csrc_count = first.map(|value| value & 0x0f);
+        let base_header_len = csrc_count.map(|count| 12 + usize::from(count) * 4);
+        let extension_words = base_header_len.and_then(|base| {
+            if extension == Some(true) && wire.len() >= base + 4 {
+                Some(u16::from_be_bytes([wire[base + 2], wire[base + 3]]))
+            } else {
+                None
+            }
+        });
+        let header_len = base_header_len.and_then(|base| {
+            if extension == Some(true) {
+                extension_words.map(|words| base + 4 + usize::from(words) * 4)
+            } else {
+                Some(base)
+            }
+        });
+        Self {
+            wire_len: wire.len(),
+            version: first.map(|value| value >> 6),
+            payload_type: wire.get(1).map(|value| value & 0x7f),
+            padding: first.map(|value| value & 0x20 != 0),
+            extension,
+            csrc_count,
+            base_header_len,
+            header_len,
+            extension_words,
+        }
+    }
+
+    fn summary(self) -> String {
+        format!(
+            "wire_len={} rtp_version={:?} pt={:?} padding={:?} extension={:?} csrc_count={:?} base_header_len={:?} header_len={:?} ext_words={:?}",
+            self.wire_len,
+            self.version,
+            self.payload_type,
+            self.padding,
+            self.extension,
+            self.csrc_count,
+            self.base_header_len,
+            self.header_len,
+            self.extension_words,
+        )
+    }
+}
+
+fn classify_decrypt_error(error: &anyhow::Error) -> InboundResult {
+    // ObfsCipher uses a distinct error for a failed HMAC. Length, padding,
+    // extension and other RTP validation errors do not imply a wrong key.
+    if error
+        .chain()
+        .any(|cause| cause.to_string() == "obfs srtp: authentication failed")
+    {
+        InboundResult::AuthFailed
+    } else {
+        InboundResult::MalformedRtp(rtp_reject_kind(error))
+    }
+}
+
+fn authenticate_inbound_result(
+    cipher: &ObfsCipher,
+    config: &ObfsConfig,
+    replay: &mut ReplayProtection,
+    packet: &mut PacketBuf,
+) -> InboundResult {
+    if !is_rtp_packet(packet.as_slice()) {
+        return InboundResult::NonRtp;
+    }
+    match cipher.unwrap(packet, config.mode) {
+        Err(error) => classify_decrypt_error(&error),
+        Ok(sequence) if replay.rtp.accept_rtp(sequence) => InboundResult::Accepted,
+        Ok(_) => InboundResult::ReplayDrop,
+    }
+}
+
+#[cfg(test)]
 fn authenticate_inbound(
     cipher: &ObfsCipher,
     config: &ObfsConfig,
     replay: &mut ReplayProtection,
     packet: &mut PacketBuf,
 ) -> bool {
-    is_rtp_packet(packet.as_slice())
-        && cipher
-            .unwrap(packet, config.mode)
-            .is_ok_and(|sequence| replay.rtp.accept_rtp(sequence))
+    authenticate_inbound_result(cipher, config, replay, packet) == InboundResult::Accepted
+}
+
+fn safe_transport_error(error: &anyhow::Error) -> String {
+    let stun = error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<TurnRequestError>()
+            .map(TurnRequestError::stun_code)
+    });
+    let io = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>());
+    format!(
+        "stun_code={stun:?} io_kind={:?} os_error={:?}",
+        io.map(std::io::Error::kind),
+        io.and_then(std::io::Error::raw_os_error)
+    )
+}
+
+fn turn_ingress_summary(
+    current: crate::turn::TurnIngressSnapshot,
+    previous: crate::turn::TurnIngressSnapshot,
+) -> String {
+    format!(
+        "turn_wire_packets={} turn_wire_bytes={} stun={} channel_data={} wrong_channel={} other_wire={} queue_drops={} pool_drops={}",
+        current.wire_packets.saturating_sub(previous.wire_packets),
+        current.wire_bytes.saturating_sub(previous.wire_bytes),
+        current.stun_packets.saturating_sub(previous.stun_packets),
+        current
+            .channel_data_packets
+            .saturating_sub(previous.channel_data_packets),
+        current
+            .wrong_channel_packets
+            .saturating_sub(previous.wrong_channel_packets),
+        current.other_packets.saturating_sub(previous.other_packets),
+        current
+            .queue_full_drops
+            .saturating_sub(previous.queue_full_drops),
+        current
+            .pool_deficit_drops
+            .saturating_sub(previous.pool_deficit_drops),
+    )
+}
+
+fn safe_reply_kind(payload: &[u8]) -> &'static str {
+    if payload.starts_with(b"TUNCONF:") {
+        return "TUNCONF";
+    }
+    if payload == b"NOCONF" {
+        return "NOCONF";
+    }
+    if payload.starts_with(b"DENIED:") {
+        return "DENIED";
+    }
+    if payload == b"READY_OK" {
+        return "READY_OK";
+    }
+    if payload.starts_with(b"ROUTING:") {
+        return "ROUTING";
+    }
+    if payload.len() >= 20
+        && payload[0] >> 4 == 4
+        && (payload[0] as usize & 0x0f) * 4 >= 20
+        && (payload[0] as usize & 0x0f) * 4 <= payload.len()
+        && u16::from_be_bytes([payload[2], payload[3]]) as usize == payload.len()
+    {
+        return "IPv4";
+    }
+    if payload.len() >= 40
+        && payload[0] >> 4 == 6
+        && u16::from_be_bytes([payload[4], payload[5]]) as usize + 40 == payload.len()
+    {
+        return "IPv6";
+    }
+    "other"
+}
+
+fn safe_denied_reason(payload: &[u8]) -> &'static str {
+    match payload {
+        b"DENIED:wrong_password" => "wrong_password",
+        b"DENIED:expired" => "expired",
+        b"DENIED:deactivated" => "deactivated",
+        b"DENIED:device_mismatch" => "device_mismatch",
+        b"DENIED:protocol_mismatch" => "protocol_mismatch",
+        b"DENIED:invalid_worker_count" => "invalid_worker_count",
+        b"DENIED:invalid_worker" => "invalid_worker",
+        b"DENIED:invalid_epoch" => "invalid_epoch",
+        b"DENIED:invalid_port" => "invalid_port",
+        b"DENIED:not_owner" => "not_owner",
+        b"DENIED:server_busy" => "server_busy",
+        _ => "other",
+    }
 }
 
 struct ActiveConnection {
@@ -603,12 +930,30 @@ impl TransportWriter {
 }
 
 impl TransportReader {
-    fn new(shared: Arc<TransportShared>, receiver: TurnReceiver) -> Self {
+    fn new(shared: Arc<TransportShared>, receiver: TurnReceiver, worker_id: usize) -> Self {
         Self {
             shared,
             receiver,
             replay: ReplayProtection::default(),
+            diagnostics: ReceiveDiagnostics::default(),
+            worker_id,
+            rejection_samples: 0,
         }
+    }
+
+    fn log_rtp_rejection(&mut self, kind: RtpRejectKind, header: RtpHeaderDiagnostics) {
+        if self.rejection_samples >= 3 {
+            return;
+        }
+        self.rejection_samples += 1;
+        crate::log_error!(
+            "[HANDSHAKE][worker={}] stage=rtp_reject reject_kind={} hmac_status={} sample={}/3 {}",
+            self.worker_id,
+            kind.as_str(),
+            kind.hmac_status(),
+            self.rejection_samples,
+            header.summary(),
+        );
     }
 
     async fn recv(&mut self) -> Result<PacketBuf> {
@@ -618,17 +963,47 @@ impl TransportReader {
                 .recv()
                 .await
                 .context("TURN allocation receive")?;
+            self.diagnostics.datagrams = self.diagnostics.datagrams.saturating_add(1);
+            self.diagnostics.wire_bytes = self
+                .diagnostics
+                .wire_bytes
+                .saturating_add(packet.len() as u64);
+            // Snapshot numeric header fields before unwrap mutates ciphertext.
+            let header = RtpHeaderDiagnostics::from_wire(packet.as_slice());
             client_perf::observe(PerfStage::TurnRx);
-            let accepted = client_perf::measure_sampled(PerfStage::CryptoObfs, 64, || {
-                authenticate_inbound(
+            let outcome = client_perf::measure_sampled(PerfStage::CryptoObfs, 64, || {
+                authenticate_inbound_result(
                     &self.shared.cipher,
                     &self.shared.config,
                     &mut self.replay,
                     &mut packet,
                 )
             });
-            if accepted {
-                return Ok(packet);
+            match outcome {
+                InboundResult::NonRtp => {
+                    self.diagnostics.non_rtp = self.diagnostics.non_rtp.saturating_add(1)
+                }
+                InboundResult::AuthFailed => {
+                    self.diagnostics.decrypt_errors =
+                        self.diagnostics.decrypt_errors.saturating_add(1);
+                    self.diagnostics.auth_failed = self.diagnostics.auth_failed.saturating_add(1);
+                }
+                InboundResult::MalformedRtp(kind) => {
+                    self.log_rtp_rejection(kind, header);
+                    self.diagnostics.decrypt_errors =
+                        self.diagnostics.decrypt_errors.saturating_add(1);
+                    self.diagnostics.malformed_rtp =
+                        self.diagnostics.malformed_rtp.saturating_add(1);
+                }
+                InboundResult::ReplayDrop => {
+                    self.diagnostics.decrypted = self.diagnostics.decrypted.saturating_add(1);
+                    self.diagnostics.replay_drops = self.diagnostics.replay_drops.saturating_add(1);
+                }
+                InboundResult::Accepted => {
+                    self.diagnostics.decrypted = self.diagnostics.decrypted.saturating_add(1);
+                    self.diagnostics.accepted = self.diagnostics.accepted.saturating_add(1);
+                    return Ok(packet);
+                }
             }
         }
     }
@@ -644,7 +1019,14 @@ pub async fn run_session(
     }
     let turn_address = select_turn_address(&credentials.server_addresses, &config)?;
     let turn_path = turn_path_key(turn_address, &config)?;
-    crate::log_error!("[TURN] Подключение к {turn_address}");
+    let connect_started = Instant::now();
+    crate::log_error!(
+        "[TURN][worker={}] stage=allocate_start endpoint={} peer={} transport={}",
+        config.id,
+        turn_path,
+        config.peer,
+        config.turn_transport.as_str()
+    );
     let cancel = runtime.cancel.clone();
     let turn_host = config.turn_host.clone();
     let turn_port = config.turn_port.clone();
@@ -666,7 +1048,17 @@ pub async fn run_session(
     ));
     let allocation = tokio::select! {
         biased;
-        result = &mut connect => result.map_err(TurnAllocateError)?,
+        result = &mut connect => match result {
+            Ok(allocation) => allocation,
+            Err(error) => {
+                crate::log_error!(
+                    "[TURN][worker={}] stage=allocate_error endpoint={} peer={} transport={} elapsed_ms={} {}",
+                    config.id, turn_path, config.peer, config.turn_transport.as_str(),
+                    connect_started.elapsed().as_millis(), safe_transport_error(&error)
+                );
+                return Err(TurnAllocateError(error).into());
+            }
+        },
         _ = cancel.cancelled() => {
             if let Ok(Ok(allocation)) = tokio::time::timeout(CONNECT_CANCEL_GRACE, &mut connect).await {
                 let _ = tokio::time::timeout(DEALLOCATE_TIMEOUT, allocation.deallocate()).await;
@@ -678,7 +1070,22 @@ pub async fn run_session(
     if let Some(ready) = runtime.allocation_ready.take() {
         let _ = ready.send(());
     }
-    crate::log_error!("[СЕССИЯ #{}] Relay: {}", config.id, allocation.local_addr());
+    crate::log_error!(
+        "[TURN][worker={}] stage=allocate_ok endpoint={} relay={} peer={} transport={} elapsed_ms={}",
+        config.id,
+        turn_path,
+        allocation.local_addr(),
+        config.peer,
+        config.turn_transport.as_str(),
+        connect_started.elapsed().as_millis()
+    );
+    let channel_started = Instant::now();
+    crate::log_error!(
+        "[TURN][worker={}] stage=channel_bind_start relay={} peer={}",
+        config.id,
+        allocation.local_addr(),
+        config.peer
+    );
     let channel = tokio::select! {
         biased;
         result = allocation.prepare_channel() => result,
@@ -688,9 +1095,29 @@ pub async fn run_session(
         },
     };
     if let Err(error) = channel {
+        crate::log_error!(
+            "[TURN][worker={}] stage=channel_bind_error peer={} elapsed_ms={} {}",
+            config.id,
+            config.peer,
+            channel_started.elapsed().as_millis(),
+            safe_transport_error(&error)
+        );
         let _ = tokio::time::timeout(DEALLOCATE_TIMEOUT, allocation.deallocate()).await;
         return Err(error.context("TURN ChannelBind обязателен"));
     }
+    crate::log_error!(
+        "[TURN][worker={}] stage=channel_bind_ok relay={} peer={} transport={} elapsed_ms={}",
+        config.id,
+        allocation.local_addr(),
+        config.peer,
+        config.turn_transport.as_str(),
+        channel_started.elapsed().as_millis()
+    );
+    crate::log_error!(
+        "[TURN][worker={}] stage=ingress_after_bind {}",
+        config.id,
+        turn_ingress_summary(allocation.ingress_snapshot(), Default::default())
+    );
     let session = tokio::spawn(run_allocated_session(
         config,
         runtime,
@@ -741,7 +1168,7 @@ async fn run_allocated_session(
     let session_cancel = CancellationToken::new();
     let turn_receiver = allocation.take_receiver()?;
     crate::log_error!(
-        "[СЕССИЯ #{}] [DIRECT] Прямой режим обфускации ({:?})",
+        "[СЕССИЯ #{}] [WRAP-SRTP] Обфускация через TURN ({:?})",
         config.id,
         config.mode
     );
@@ -752,7 +1179,7 @@ async fn run_allocated_session(
         pool: runtime.pool.clone(),
     });
     let mut writer_transport = TransportWriter::new(shared.clone());
-    let mut reader_transport = TransportReader::new(shared, turn_receiver);
+    let mut reader_transport = TransportReader::new(shared, turn_receiver, config.id);
     let incarnation_id = NEXT_INCARNATION_ID.fetch_add(1, Ordering::Relaxed).max(1);
     let config_tx = config.get_config.then(|| runtime.config_tx.clone());
     let config_delivered = match request_configuration(
@@ -833,7 +1260,7 @@ async fn run_allocated_session(
         _ = runtime.cancel.cancelled() => {
             runtime
                 .shutdown
-                .request_disconnect(&config.device_id, &config.salt)
+                .request_disconnect(&config.password, &config.salt)
                 .await;
             (Ok(()), 0)
         }
@@ -877,6 +1304,12 @@ async fn stop_session_tasks(
     }
 }
 
+fn config_supports_stream_repair(value: &str) -> bool {
+    value
+        .split(':')
+        .any(|field| matches!(field, "stream-v1" | "stream-v2"))
+}
+
 async fn request_configuration(
     writer: &mut TransportWriter,
     reader: &mut TransportReader,
@@ -885,30 +1318,158 @@ async fn request_configuration(
     config_tx: Option<mpsc::Sender<String>>,
 ) -> Result<bool> {
     let request = build_registration_payload(config);
+    let total_start = reader.diagnostics;
+    let total_ingress_start = reader.receiver.ingress_snapshot();
+    let handshake_started = Instant::now();
+    let mut unexpected_total = 0u64;
     'attempts: for (attempt, timeout_ms) in CONFIG_RESPONSE_TIMEOUT_MS.into_iter().enumerate() {
-        writer
-            .send_bytes(request.as_ref())
-            .await
-            .context("отправка GETCONF")?;
+        let attempt_start = reader.diagnostics;
+        let attempt_ingress_start = reader.receiver.ingress_snapshot();
+        let attempt_started = Instant::now();
+        let mut unexpected = 0u64;
+        crate::log_error!(
+            "[HANDSHAKE][worker={}] stage=getconf_send peer={} transport={} attempt={}/{} timeout_ms={} payload_bytes={} desired_workers={}",
+            config.id,
+            config.peer,
+            config.turn_transport.as_str(),
+            attempt + 1,
+            CONFIG_RESPONSE_TIMEOUT_MS.len(),
+            timeout_ms,
+            request.len(),
+            config.desired_count
+        );
+        if let Err(error) = writer.send_bytes(request.as_ref()).await {
+            crate::log_error!(
+                "[HANDSHAKE][worker={}] stage=getconf_send_error attempt={} {}",
+                config.id,
+                attempt + 1,
+                safe_transport_error(&error)
+            );
+            return Err(error.context("отправка GETCONF"));
+        }
+        crate::log_error!(
+            "[HANDSHAKE][worker={}] stage=getconf_sent attempt={} sent_payload_bytes={}",
+            config.id,
+            attempt + 1,
+            request.len()
+        );
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
         let packet = loop {
             match tokio::time::timeout_at(deadline, reader.recv()).await {
                 Ok(result) => {
-                    let packet = result.context("GETCONF чтение ответа конфига")?;
+                    let packet = match result {
+                        Ok(packet) => packet,
+                        Err(error) => {
+                            crate::log_error!(
+                                "[HANDSHAKE][worker={}] stage=receive_error attempt={} {} {}",
+                                config.id,
+                                attempt + 1,
+                                reader.diagnostics.since(attempt_start).summary(),
+                                safe_transport_error(&error)
+                            );
+                            return Err(error.context("GETCONF чтение ответа конфига"));
+                        }
+                    };
                     if is_panel_restart_notice(packet.as_slice()) {
+                        crate::log_error!(
+                            "[HANDSHAKE][worker={}] stage=server_restart_notice attempt={}",
+                            config.id,
+                            attempt + 1
+                        );
                         events.panel_restart();
                         continue;
                     }
                     if !is_config_response(packet.as_slice()) {
+                        unexpected = unexpected.saturating_add(1);
+                        unexpected_total = unexpected_total.saturating_add(1);
+                        if unexpected <= 3 {
+                            crate::log_error!(
+                                "[HANDSHAKE][worker={}] stage=unexpected_reply attempt={} kind={} payload_bytes={}",
+                                config.id,
+                                attempt + 1,
+                                safe_reply_kind(packet.as_slice()),
+                                packet.len()
+                            );
+                        }
                         continue;
+                    }
+                    crate::log_error!(
+                        "[HANDSHAKE][worker={}] stage=config_reply attempt={} kind={} payload_bytes={} elapsed_ms={} {} unexpected={}",
+                        config.id,
+                        attempt + 1,
+                        safe_reply_kind(packet.as_slice()),
+                        packet.len(),
+                        attempt_started.elapsed().as_millis(),
+                        reader.diagnostics.since(attempt_start).summary(),
+                        unexpected
+                    );
+                    crate::log_error!(
+                        "[HANDSHAKE][worker={}] stage=reply_ingress attempt={} {}",
+                        config.id,
+                        attempt + 1,
+                        turn_ingress_summary(
+                            reader.receiver.ingress_snapshot(),
+                            attempt_ingress_start
+                        )
+                    );
+                    if packet.as_slice().starts_with(b"DENIED:") {
+                        crate::log_error!(
+                            "[HANDSHAKE][worker={}] stage=server_denied reason={}",
+                            config.id,
+                            safe_denied_reason(packet.as_slice())
+                        );
                     }
                     break packet;
                 }
-                Err(_) if attempt + 1 < CONFIG_RESPONSE_TIMEOUT_MS.len() => continue 'attempts,
                 Err(_) => {
+                    let delta = reader.diagnostics.since(attempt_start);
+                    crate::log_error!(
+                        "[HANDSHAKE][worker={}] stage=getconf_timeout peer={} transport={} attempt={}/{} elapsed_ms={} reason={} {} unexpected={}",
+                        config.id,
+                        config.peer,
+                        config.turn_transport.as_str(),
+                        attempt + 1,
+                        CONFIG_RESPONSE_TIMEOUT_MS.len(),
+                        attempt_started.elapsed().as_millis(),
+                        delta.timeout_kind(),
+                        delta.summary(),
+                        unexpected
+                    );
+                    crate::log_error!(
+                        "[HANDSHAKE][worker={}] stage=timeout_ingress attempt={} {}",
+                        config.id,
+                        attempt + 1,
+                        turn_ingress_summary(
+                            reader.receiver.ingress_snapshot(),
+                            attempt_ingress_start
+                        )
+                    );
+                    if attempt + 1 < CONFIG_RESPONSE_TIMEOUT_MS.len() {
+                        continue 'attempts;
+                    }
+                    let total = reader.diagnostics.since(total_start);
+                    crate::log_error!(
+                        "[HANDSHAKE][worker={}] stage=failed peer={} elapsed_ms={} reason={} {} unexpected={}",
+                        config.id,
+                        config.peer,
+                        handshake_started.elapsed().as_millis(),
+                        total.timeout_kind(),
+                        total.summary(),
+                        unexpected_total
+                    );
+                    crate::log_error!(
+                        "[HANDSHAKE][worker={}] stage=failed_ingress {}",
+                        config.id,
+                        turn_ingress_summary(
+                            reader.receiver.ingress_snapshot(),
+                            total_ingress_start
+                        )
+                    );
                     let message = format!(
-                        "FATAL_HANDSHAKE: сервер не подтвердил конфигурацию после {} попыток; проверьте пароль подключения и совместимость клиента с сервером",
-                        CONFIG_RESPONSE_TIMEOUT_MS.len()
+                        "FATAL_HANDSHAKE: конфигурация не подтверждена после {} попыток: {}; диагностика [HANDSHAKE] worker={}",
+                        CONFIG_RESPONSE_TIMEOUT_MS.len(),
+                        total.timeout_hint(),
+                        config.id
                     );
                     if config.get_config {
                         events.error("handshake_timeout", &message, true);
@@ -917,31 +1478,49 @@ async fn request_configuration(
                 }
             }
         };
-        let response = parse_config_response(packet.as_slice()).inspect_err(|error| {
+        let response = parse_config_response(packet.as_slice()).map_err(|error| {
+            if packet.as_slice().starts_with(b"DENIED:")
+                && safe_denied_reason(packet.as_slice()) == "other"
+            {
+                anyhow!("FATAL_AUTH: сервер отклонил подключение; причина не распознана, см. журнал сервера")
+            } else {
+                error
+            }
+        }).inspect_err(|error| {
             let message = error.to_string();
             if config.get_config && message.contains("FATAL_") {
                 events.error("handshake_rejected", &message, true);
             }
         })?;
         match response {
-            ConfigResponse::NoConfig => return Ok(false),
+            ConfigResponse::NoConfig => {
+                crate::log_error!(
+                    "[HANDSHAKE][worker={}] stage=no_config peer={}",
+                    config.id,
+                    config.peer
+                );
+                return Ok(false);
+            }
             ConfigResponse::Config(value) => {
-                if value.ends_with(":stream-v1") || value.ends_with(":stream-v2") {
+                if config_supports_stream_repair(&value) {
                     config.server_stream_repair.store(true, Ordering::Release);
                 }
                 if let Some(sender) = &config_tx {
                     let _ = sender.try_send(value);
                 }
+                crate::log_error!(
+                    "[HANDSHAKE][worker={}] stage=ready peer={} transport={} elapsed_ms={}",
+                    config.id,
+                    config.peer,
+                    config.turn_transport.as_str(),
+                    handshake_started.elapsed().as_millis()
+                );
                 crate::log_error!("[ВОРКЕР #{}] Конфиг получен", config.id);
                 return Ok(true);
             }
         }
     }
-    let message = "FATAL_HANDSHAKE: сервер не подтвердил конфигурацию";
-    if config.get_config {
-        events.error("handshake_timeout", message, true);
-    }
-    bail!(message)
+    bail!("FATAL_HANDSHAKE: конфигурационный ответ не получен; см. журнал [HANDSHAKE]")
 }
 
 async fn writer_loop(
@@ -1158,6 +1737,10 @@ async fn reader_loop(
         if is_control_response(packet.as_slice()) {
             continue;
         }
+        if packet.as_slice().first().copied() == Some(crate::wire_protocol::CSQTT_FRAG_MAGIC) {
+            dispatcher.handle_incoming_fragment(packet.as_slice());
+            continue;
+        }
         // [FOCSQ] В TUN можно писать только IP-пакеты. Служебные ответы
         // сервера (например, однобайтовый 0xFF) не распознаны выше и
         // ядро отвергло бы их записью EINVAL, что раньше убивало задачу
@@ -1187,10 +1770,7 @@ async fn reader_loop(
         }
         if !logged_first_data {
             logged_first_data = true;
-            crate::log_error!(
-                "[СЕССИЯ] Первый data-пакет от пира: {} байт",
-                packet.len()
-            );
+            crate::log_error!("[СЕССИЯ] Первый data-пакет от пира: {} байт", packet.len());
         }
         deliver_inbound_packet(&dispatcher, packet);
     }
@@ -1210,7 +1790,7 @@ fn deliver_inbound_packet(dispatcher: &Dispatcher, packet: PacketBuf) {
 /// Важно: вызывать на `flow_frame::payload(...)`, а не на сырых байтах —
 /// TCP-downlink приходит в фрейме CQF1 (24 байта), чей первый байт
 /// `'C'` (0x43) читается как IPv4 с IHL = 3 и провалил бы проверку.
-fn is_ip_packet(packet: &[u8]) -> bool {
+pub(crate) fn is_ip_packet(packet: &[u8]) -> bool {
     match packet.first().map(|byte| byte >> 4) {
         Some(4) => {
             if packet.len() < 20 {
@@ -1271,6 +1851,149 @@ mod tests {
     use std::future::pending;
 
     #[test]
+    fn handshake_diagnostics_distinguish_silence_decryption_and_unexpected_replies() {
+        let silent = ReceiveDiagnostics::default();
+        assert_eq!(silent.timeout_kind(), "no_turn_payload");
+        assert!(!silent.timeout_hint().contains("пароль"));
+        let bad_crypto = ReceiveDiagnostics {
+            datagrams: 3,
+            decrypt_errors: 3,
+            auth_failed: 3,
+            ..silent
+        };
+        assert_eq!(bad_crypto.timeout_kind(), "authentication_failed");
+        let malformed = ReceiveDiagnostics {
+            datagrams: 3,
+            decrypt_errors: 3,
+            malformed_rtp: 3,
+            ..silent
+        };
+        assert_eq!(malformed.timeout_kind(), "malformed_rtp");
+        assert!(!malformed.timeout_hint().contains("пароль"));
+        assert_eq!(malformed.since(silent).malformed_rtp, 3);
+        let unexpected = ReceiveDiagnostics {
+            datagrams: 2,
+            decrypted: 2,
+            accepted: 2,
+            ..silent
+        };
+        assert_eq!(unexpected.timeout_kind(), "no_configuration_reply");
+        assert!(!unexpected.timeout_hint().contains("пароль"));
+        assert_eq!(bad_crypto.since(silent).decrypt_errors, 3);
+    }
+
+    #[test]
+    fn handshake_diagnostics_separate_failed_authentication_from_malformed_rtp() {
+        assert_eq!(
+            classify_decrypt_error(&anyhow!("obfs srtp: authentication failed")),
+            InboundResult::AuthFailed
+        );
+        for (message, expected) in [
+            (
+                "obfs srtp: missing payload or authentication tag",
+                RtpRejectKind::MissingTag,
+            ),
+            (
+                "obfs srtp: invalid padding length 0",
+                RtpRejectKind::InvalidPadding,
+            ),
+            (
+                "obfs: packet too short for extension header",
+                RtpRejectKind::TruncatedExtension,
+            ),
+        ] {
+            assert_eq!(
+                classify_decrypt_error(&anyhow!(message)),
+                InboundResult::MalformedRtp(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn rtp_reject_diagnostics_use_fixed_labels_without_echoing_errors() {
+        let cases = [
+            (
+                "obfs: unsupported payload type 99",
+                RtpRejectKind::UnsupportedPt,
+            ),
+            (
+                "obfs: packet too short for RTP CSRCs",
+                RtpRejectKind::TruncatedCsrc,
+            ),
+            (
+                "obfs: packet too short for extension header",
+                RtpRejectKind::TruncatedExtension,
+            ),
+            (
+                "obfs srtp: missing payload or authentication tag",
+                RtpRejectKind::MissingTag,
+            ),
+            (
+                "obfs srtp: invalid padding length 0",
+                RtpRejectKind::InvalidPadding,
+            ),
+            ("fixture-secret unknown error", RtpRejectKind::Other),
+        ];
+        for (message, expected) in cases {
+            let kind = rtp_reject_kind(&anyhow!(message));
+            assert_eq!(kind, expected);
+            assert!(!kind.as_str().contains("fixture-secret"));
+        }
+        assert_eq!(RtpRejectKind::InvalidPadding.hmac_status(), "verified");
+        assert_eq!(RtpRejectKind::MissingTag.hmac_status(), "not_checked");
+        assert_eq!(RtpRejectKind::Other.hmac_status(), "unknown");
+    }
+
+    #[test]
+    fn rtp_header_diagnostics_capture_only_safe_pre_unwrap_metadata() {
+        let mut wire = [0u8; 60];
+        wire[0] = 0xb0;
+        wire[1] = 111;
+        wire[14..16].copy_from_slice(&2u16.to_be_bytes());
+        wire[24..38].copy_from_slice(b"fixture-secret");
+        let header = RtpHeaderDiagnostics::from_wire(&wire);
+        assert_eq!(header.wire_len, 60);
+        assert_eq!(header.version, Some(2));
+        assert_eq!(header.payload_type, Some(111));
+        assert_eq!(header.padding, Some(true));
+        assert_eq!(header.extension, Some(true));
+        assert_eq!(header.csrc_count, Some(0));
+        assert_eq!(header.header_len, Some(24));
+        assert_eq!(header.extension_words, Some(2));
+        assert!(!header.summary().contains("fixture-secret"));
+    }
+
+    #[test]
+    fn rtp_header_diagnostics_handle_truncated_headers_without_reading_payload() {
+        let empty = RtpHeaderDiagnostics::from_wire(&[]);
+        assert_eq!(empty.version, None);
+        assert_eq!(empty.header_len, None);
+        let truncated = RtpHeaderDiagnostics::from_wire(&[0xb2]);
+        assert_eq!(truncated.csrc_count, Some(2));
+        assert_eq!(truncated.base_header_len, Some(20));
+        assert_eq!(truncated.extension_words, None);
+        assert_eq!(truncated.header_len, None);
+        assert_eq!(truncated.payload_type, None);
+    }
+
+    #[test]
+    fn handshake_diagnostic_labels_never_echo_untrusted_payloads() {
+        assert_eq!(
+            safe_denied_reason(b"DENIED:wrong_password"),
+            "wrong_password"
+        );
+        assert_eq!(safe_denied_reason(b"DENIED:secret-token-value"), "other");
+        assert_eq!(safe_reply_kind(b"GETCONF:secret-password|token"), "other");
+        assert_eq!(safe_reply_kind(b"ROUTING:secret-value"), "ROUTING");
+        let mut ipv4 = [0u8; 20];
+        ipv4[0] = 0x45;
+        ipv4[3] = 20;
+        assert_eq!(safe_reply_kind(&ipv4), "IPv4");
+        let error = anyhow!("secret-password secret-token");
+        assert!(!safe_transport_error(&error).contains("secret"));
+    }
+
+    #[test]
     fn transport_selection_skips_incompatible_turn_endpoints() {
         let addresses: Arc<[Arc<str>]> = [
             Arc::from("turn:relay.example:3478?transport=udp"),
@@ -1325,7 +2048,7 @@ mod tests {
         };
         assert_eq!(
             build_registration_payload(&config).as_ref(),
-            b"GETCONF:9000|device|password|7|generation-id|1|9|CSQTT-WIRE-3"
+            b"GETCONF:9000|password|7|generation-id|1|9"
         );
     }
 
@@ -1340,14 +2063,14 @@ mod tests {
 
         let coordinator = shutdown.clone();
         let task = tokio::spawn(async move {
-            coordinator.request_disconnect("device", "salt").await;
+            coordinator.request_disconnect("password", "salt").await;
         });
         let command = tokio::time::timeout(Duration::from_millis(100), older_rx.recv())
             .await
             .unwrap_or(None);
         let completion = match command {
             Some(WriterCommand::SendBytes { data, completion }) => {
-                assert_eq!(data.as_ref(), b"DISCONNECT:device|salt");
+                assert_eq!(data.as_ref(), b"DISCONNECT:password|salt");
                 completion
             }
             None => panic!("shutdown did not select the active control stream"),
@@ -1375,7 +2098,7 @@ mod tests {
 
         let coordinator = shutdown.clone();
         let task = tokio::spawn(async move {
-            coordinator.request_disconnect("device", "salt").await;
+            coordinator.request_disconnect("password", "salt").await;
         });
         let command = tokio::time::timeout(Duration::from_millis(100), active_rx.recv())
             .await
@@ -2038,6 +2761,22 @@ mod tests {
         .complete(false);
         assert!(!sent.load(Ordering::Acquire));
         assert!(!in_flight.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn stream_repair_capability_survives_workers_metadata() {
+        assert!(config_supports_stream_repair(
+            "TUNCONF:10.66.67.2:1.1.1.1:0:stream-v1:workers=18"
+        ));
+        assert!(config_supports_stream_repair(
+            "TUNCONF:10.66.67.2:1.1.1.1:0:stream-v2:workers=9"
+        ));
+        assert!(!config_supports_stream_repair(
+            "TUNCONF:10.66.67.2:1.1.1.1:0:stream-v10:workers=9"
+        ));
+        assert!(!config_supports_stream_repair(
+            "TUNCONF:10.66.67.2:1.1.1.1:0:workers=9"
+        ));
     }
 
     #[test]

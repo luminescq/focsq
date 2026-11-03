@@ -3,12 +3,12 @@
 
 use anyhow::{Result, bail};
 
-use crate::wire_protocol::WIRE_PROTOCOL_REVISION;
+use crate::wire_protocol::PATH_ECHO_PREFIX;
 
 pub const PANEL_RESTART_NOTICE: &[u8] = b"\xffCSQTT_PANEL_RESTART_V1\x00\x91\x7d\x03\xa8";
 pub const STREAM_REPAIR_PREFIX: &[u8] = b"\xffCSQTT_STREAM_REPAIR_V1";
 pub const STREAM_ALIVE_PREFIX: &[u8] = b"\xffCSQTT_STREAM_ALIVE_V1";
-const MAX_STREAM_WORKERS: u16 = 126;
+const MAX_STREAM_WORKERS: u16 = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigResponse {
@@ -25,7 +25,7 @@ pub struct StreamRepairCommand {
 
 pub fn config_request(
     local_port: &str,
-    device_id: &str,
+    _device_id: &str,
     password: &str,
     generation_id: u64,
     salt: &str,
@@ -33,9 +33,7 @@ pub fn config_request(
     desired_count: Option<usize>,
 ) -> String {
     let desired_count = desired_count.map_or_else(String::new, |value| value.to_string());
-    format!(
-        "GETCONF:{local_port}|{device_id}|{password}|{generation_id}|{salt}|{worker_id}|{desired_count}|{WIRE_PROTOCOL_REVISION}"
-    )
+    format!("GETCONF:{local_port}|{password}|{generation_id}|{salt}|{worker_id}|{desired_count}")
 }
 
 pub fn parse_config_response(response: &[u8]) -> Result<ConfigResponse> {
@@ -47,10 +45,12 @@ pub fn parse_config_response(response: &[u8]) -> Result<ConfigResponse> {
         match reason {
             "wrong_password" => bail!("FATAL_AUTH: неверный пароль подключения"),
             "expired" => bail!("FATAL_AUTH: срок действия пароля истёк"),
+            "deactivated" => bail!("FATAL_AUTH: аккаунт деактивирован"),
             "device_mismatch" => {
                 bail!("FATAL_AUTH: пароль привязан к другому устройству")
             }
-            "protocol_mismatch" | "invalid_worker_count" => bail!(
+            "invalid_worker_count" => bail!("FATAL_LIMIT: превышен лимит потоков сервера"),
+            "protocol_mismatch" => bail!(
                 "FATAL_PROTOCOL: клиент и сервер используют разные версии протокола; выполните деплой из этой версии приложения"
             ),
             _ => bail!("FATAL_AUTH: доступ запрещён ({reason})"),
@@ -82,6 +82,10 @@ pub fn is_control_response(response: &[u8]) -> bool {
         b"DENIED:".as_slice(),
         b"READY_OK".as_slice(),
         b"OK:disconnected".as_slice(),
+        b"ROUTING:".as_slice(),
+        b"TUNWORKERS:".as_slice(),
+        b"WORKERS:".as_slice(),
+        PATH_ECHO_PREFIX,
         STREAM_REPAIR_PREFIX,
         STREAM_ALIVE_PREFIX,
     ]
@@ -93,8 +97,8 @@ pub fn is_panel_restart_notice(response: &[u8]) -> bool {
     response == PANEL_RESTART_NOTICE
 }
 
-pub fn disconnect_request(device_id: &str, salt: &str) -> String {
-    format!("DISCONNECT:{device_id}|{salt}")
+pub fn disconnect_request(password: &str, salt: &str) -> String {
+    format!("DISCONNECT:{password}|{salt}")
 }
 
 pub fn parse_stream_repair(payload: &[u8]) -> Option<StreamRepairCommand> {
@@ -141,14 +145,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn request_matches_go_contract() {
+    fn request_matches_csqtt_250_contract() {
         assert_eq!(
             config_request("9000", "device", "password", 7, "salt", 4, None),
-            "GETCONF:9000|device|password|7|salt|4||CSQTT-WIRE-3"
+            "GETCONF:9000|password|7|salt|4|"
         );
         assert_eq!(
             config_request("9000", "device", "password", 7, "salt", 4, Some(36)),
-            "GETCONF:9000|device|password|7|salt|4|36|CSQTT-WIRE-3"
+            "GETCONF:9000|password|7|salt|4|36"
         );
     }
 
@@ -227,6 +231,44 @@ mod tests {
         assert!(parse_stream_alive(&payload).is_none());
         payload[STREAM_REPAIR_PREFIX.len() + 10] = 0;
         assert!(parse_stream_repair(&payload).is_none());
+    }
+
+    #[test]
+    fn numeric_password_keeps_canonical_field_positions() {
+        let request = config_request("9000", "device", "123456", 7, "salt", 4, Some(99));
+        assert_eq!(request, "GETCONF:9000|123456|7|salt|4|99");
+        assert_eq!(
+            disconnect_request("123456", "salt"),
+            "DISCONNECT:123456|salt"
+        );
+    }
+
+    #[test]
+    fn server_250_denials_are_actionable() {
+        assert!(
+            parse_config_response(b"DENIED:deactivated")
+                .unwrap_err()
+                .to_string()
+                .contains("FATAL_AUTH")
+        );
+        assert!(
+            parse_config_response(b"DENIED:invalid_worker_count")
+                .unwrap_err()
+                .to_string()
+                .contains("FATAL_LIMIT")
+        );
+    }
+
+    #[test]
+    fn server_250_control_updates_do_not_enter_tun() {
+        for value in [
+            b"ROUTING:direct".as_slice(),
+            b"TUNWORKERS:18",
+            b"WORKERS:18",
+            PATH_ECHO_PREFIX,
+        ] {
+            assert!(is_control_response(value));
+        }
     }
 
     #[test]

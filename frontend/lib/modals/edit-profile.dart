@@ -7,6 +7,7 @@ import '../models/server_profile.dart';
 import '../service/alert.dart';
 import '../service/db.dart';
 import '../service/import.dart';
+import '../service/worker_limits.dart';
 
 class EditProfileModal extends StatefulWidget {
   final ServerProfile profile;
@@ -68,7 +69,9 @@ class _EditProfileModalState extends State<EditProfileModal> {
       text: widget.profile.port?.toString() ?? '',
     );
     _passCtrl = TextEditingController(text: widget.profile.password);
-    _power = widget.profile.power?.toDouble() ?? 9;
+    _power = normalizeWorkerCount(widget.profile.power).toDouble();
+    // Keep the slider valid while settings load, including old 162-worker profiles.
+    if (_power > _maxPower) _maxPower = _power;
     _ipCtrl.addListener(() => _clearError(() => _ipError = null));
     _portCtrl.addListener(() => _clearError(() => _portError = null));
     _passCtrl.addListener(() => _clearError(() => _passError = null));

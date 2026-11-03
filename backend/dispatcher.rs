@@ -3,7 +3,7 @@
 
 use crate::{
     client_perf::{self, Stage as PerfStage},
-    flow_frame::{self, FlowSequencer},
+    flow_frame,
     packet::{PacketBuf, PacketPool},
     stats::Stats,
     striped_scheduler::{DispatchTicket, PacketClass, packet_class},
@@ -20,7 +20,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -83,16 +83,6 @@ impl ReturnReorder {
     fn pop(&mut self) -> Option<PacketBuf> {
         self.ready.pop_front()
     }
-}
-
-fn frame_outbound_packet(sequences: &mut FlowSequencer, packet: &mut PacketBuf) -> bool {
-    let Some(header) = sequences.next(packet.as_slice()) else {
-        return true;
-    };
-    let Ok(prefix) = packet.prepend(flow_frame::FRAME_LEN) else {
-        return false;
-    };
-    header.encode(prefix)
 }
 
 #[derive(Clone, Copy, Default)]
@@ -401,6 +391,9 @@ fn interleave_turn_paths(workers: &mut Vec<WorkerChannels>) {
 
 pub struct Dispatcher {
     workers: ArcSwap<Vec<WorkerChannels>>,
+    pool: Arc<PacketPool>,
+    fragment_reassembler: crate::wire_protocol::ShardedReassembler,
+    next_fragment_id: AtomicU16,
     return_latency_tx: PacketSender,
     return_priority_tx: PacketSender,
     return_tx: PacketSender,
@@ -423,6 +416,9 @@ impl Dispatcher {
         let (return_tx, mut return_rx) = packet_channel(RETURN_BULK_CAPACITY, true);
         let dispatcher = Arc::new(Self {
             workers: ArcSwap::from_pointee(Vec::new()),
+            pool: pool.clone(),
+            fragment_reassembler: crate::wire_protocol::ShardedReassembler::new(),
+            next_fragment_id: AtomicU16::new(1),
             return_latency_tx,
             return_priority_tx,
             return_tx,
@@ -464,6 +460,9 @@ impl Dispatcher {
         let (return_tx, return_rx) = packet_channel(RETURN_BULK_CAPACITY, !tun_mode);
         let dispatcher = Arc::new(Self {
             workers: ArcSwap::from_pointee(Vec::new()),
+            pool: pool.clone(),
+            fragment_reassembler: crate::wire_protocol::ShardedReassembler::new(),
+            next_fragment_id: AtomicU16::new(1),
             return_latency_tx,
             return_priority_tx,
             return_tx,
@@ -494,10 +493,16 @@ impl Dispatcher {
                 return Ok((dispatcher, "0".to_owned()));
             }
             #[cfg(windows)]
-            anyhow::bail!("TUN-режим {name:?} не поддерживается на Windows (доступен только wintun)");
+            anyhow::bail!(
+                "TUN-режим {name:?} не поддерживается на Windows (доступен только wintun)"
+            );
             #[cfg(target_os = "linux")]
             {
-                let interface = if name == "tun" { "csqtt".to_owned() } else { name };
+                let interface = if name == "tun" {
+                    "csqtt".to_owned()
+                } else {
+                    name
+                };
                 let device = crate::tun_linux::TunDevice::open(&interface)?;
                 let file = device.nonblocking_file()?;
                 crate::log_error!("[КЛИЕНТ] TUN-интерфейс {interface} открыт нативно");
@@ -610,6 +615,30 @@ impl Dispatcher {
         });
     }
 
+    // The server can stripe a fragmented IP packet across TURN sessions.
+    // Reassemble at dispatcher scope before handing anything to the OS TUN.
+    pub fn handle_incoming_fragment(&self, fragment: &[u8]) {
+        self.fragment_reassembler.process_fragment_from(
+            0,
+            fragment,
+            std::time::Instant::now(),
+            |assembled| {
+                if !crate::session::is_ip_packet(assembled) {
+                    return;
+                }
+                if let Some(mut packet) = self.pool.try_acquire() {
+                    let area = packet.read_area();
+                    if assembled.len() <= area.len() {
+                        area[..assembled.len()].copy_from_slice(assembled);
+                        if packet.set_read_len(assembled.len()).is_ok() {
+                            self.return_packet(packet);
+                        }
+                    }
+                }
+            },
+        );
+    }
+
     pub async fn shutdown(&self) {
         self.cancel.cancel();
         for task in self.tasks.lock().await.drain(..) {
@@ -684,7 +713,7 @@ impl Dispatcher {
         use std::os::fd::AsRawFd;
 
         let mut scheduler = FastPathScheduler::new();
-        let mut flow_sequences = FlowSequencer::new();
+
         loop {
             let readiness = tokio::select! {
                 _ = self.cancel.cancelled() => return,
@@ -727,9 +756,7 @@ impl Dispatcher {
                         if packet.set_read_len(length).is_err() {
                             return;
                         }
-                        if !frame_outbound_packet(&mut flow_sequences, &mut packet) {
-                            continue;
-                        }
+
                         stats
                             .total_bytes_up
                             .fetch_add(length as i64, Ordering::Relaxed);
@@ -762,7 +789,7 @@ impl Dispatcher {
         let mut receive_batch = Vec::with_capacity(udp_batch::MAX_DATAGRAMS);
         let mut sources = [SocketAddr::from(([0, 0, 0, 0], 0)); udp_batch::MAX_DATAGRAMS];
         let mut scheduler = FastPathScheduler::new();
-        let mut flow_sequences = FlowSequencer::new();
+
         loop {
             let readiness = tokio::select! {
                 _ = self.cancel.cancelled() => return,
@@ -808,10 +835,7 @@ impl Dispatcher {
                             client.store(Some(Arc::new(address)));
                         }
                         client_perf::observe(PerfStage::UdpRx);
-                        let mut packet = packet;
-                        if !frame_outbound_packet(&mut flow_sequences, &mut packet) {
-                            continue;
-                        }
+
                         stats
                             .total_bytes_up
                             .fetch_add(packet.len() as i64, Ordering::Relaxed);
@@ -834,18 +858,47 @@ impl Dispatcher {
     }
 
     fn dispatch(&self, scheduler: &mut FastPathScheduler, packet: PacketBuf) {
-        self.dispatch_now(scheduler, packet);
-    }
-
-    fn dispatch_now(&self, scheduler: &mut FastPathScheduler, packet: PacketBuf) {
+        if packet.len() > crate::wire_protocol::MAX_PACKET_LEN {
+            return;
+        }
         let Some(ticket) = client_perf::measure_sampled(PerfStage::Scheduler, 64, || {
             scheduler.begin(&self.workers, packet.as_slice())
         }) else {
             return;
         };
         let workers = scheduler.workers();
-        if let Err(packet) = enqueue_selected_worker(workers, ticket, packet) {
-            let _ = replace_oldest_in_selected_queue(workers, ticket, packet);
+        if packet.len() <= 1280 {
+            // CSQTT 2.5 accepts raw IP here, never the older CQF1 envelope.
+            if let Err(packet) = enqueue_selected_worker(workers, ticket, packet) {
+                let _ = replace_oldest_in_selected_queue(workers, ticket, packet);
+            }
+            return;
+        }
+
+        let expected = packet
+            .len()
+            .div_ceil(crate::wire_protocol::MAX_FRAG_PAYLOAD);
+        let packet_id = self.next_fragment_id.fetch_add(1, Ordering::Relaxed);
+        let mut fragments = Vec::with_capacity(expected);
+        crate::wire_protocol::fragment_packet(packet_id, packet.as_slice(), |fragment| {
+            if let Some(mut buffer) = self.pool.try_acquire() {
+                let area = buffer.read_area();
+                if fragment.len() <= area.len() {
+                    area[..fragment.len()].copy_from_slice(fragment);
+                    if buffer.set_read_len(fragment.len()).is_ok() {
+                        fragments.push(buffer);
+                    }
+                }
+            }
+        });
+        // Do not send an incomplete fragment set if packet buffers ran out.
+        if fragments.len() != expected {
+            return;
+        }
+        for fragment in fragments {
+            if let Err(fragment) = enqueue_selected_worker(workers, ticket, fragment) {
+                let _ = replace_oldest_in_selected_queue(workers, ticket, fragment);
+            }
         }
     }
 
@@ -1172,7 +1225,7 @@ impl Dispatcher {
             .name("csqtt-wintun-reader".to_owned())
             .spawn(move || {
                 let mut scheduler = FastPathScheduler::new();
-                let mut flow_sequences = FlowSequencer::new();
+
                 while !reader_cancel.is_cancelled() {
                     match device.receive_blocking() {
                         Ok(bytes) => {
@@ -1189,9 +1242,7 @@ impl Dispatcher {
                             if packet.set_read_len(bytes.len()).is_err() {
                                 break;
                             }
-                            if !frame_outbound_packet(&mut flow_sequences, &mut packet) {
-                                continue;
-                            }
+
                             read_stats
                                 .total_bytes_up
                                 .fetch_add(bytes.len() as i64, Ordering::Relaxed);
@@ -1244,9 +1295,12 @@ impl Dispatcher {
             // Burst write: сразу дренируем очереди до 64 пакетов
             let mut burst = 0usize;
             while burst < 64 {
-                let Some(next) =
-                    next_ordered_return_packet(&mut reorder, &latency_receiver, &priority_receiver, &bulk_receiver)
-                else {
+                let Some(next) = next_ordered_return_packet(
+                    &mut reorder,
+                    &latency_receiver,
+                    &priority_receiver,
+                    &bulk_receiver,
+                ) else {
                     break;
                 };
                 burst += 1;
@@ -1381,9 +1435,7 @@ fn is_closed_tun_error(error: &std::io::Error) -> bool {
 fn log_dropped_packet(counter: &mut u64, reason: &str) {
     *counter += 1;
     if *counter <= 8 || counter.is_multiple_of(1000) {
-        crate::log_error!(
-            "[ОШИБКА] Запись TUN: пакет #{counter} отброшен ({reason})"
-        );
+        crate::log_error!("[ОШИБКА] Запись TUN: пакет #{counter} отброшен ({reason})");
     }
 }
 
@@ -1522,9 +1574,13 @@ mod tests {
         let (return_latency_tx, return_latency_rx) = packet_channel(8, true);
         let (return_priority_tx, return_priority_rx) = packet_channel(16, true);
         let (return_tx, return_rx) = packet_channel(64, true);
+        let pool = PacketPool::new(128);
         (
             Arc::new(Dispatcher {
                 workers: ArcSwap::from_pointee(Vec::new()),
+                pool: pool.clone(),
+                fragment_reassembler: crate::wire_protocol::ShardedReassembler::new(),
+                next_fragment_id: AtomicU16::new(1),
                 return_latency_tx,
                 return_priority_tx,
                 return_tx,
@@ -1749,17 +1805,81 @@ mod tests {
     }
 
     #[test]
-    fn outbound_tcp_frame_preserves_the_inner_packet_and_sequence() {
+    fn outbound_tcp_is_raw_ip_without_a_cqf1_envelope() {
+        let (dispatcher, _latency, _priority, _bulk) = test_dispatcher();
         let pool = PacketPool::new(1);
-        let mut packet = tcp_packet(&pool, 50_000, 77);
-        let mut sequences = FlowSequencer::with_sender_id(9);
-        assert!(frame_outbound_packet(&mut sequences, &mut packet));
-        let (header, payload) = flow_frame::FrameHeader::decode(packet.as_slice()).unwrap();
-        assert_eq!(header.sender_id, 9);
-        assert_eq!(header.sequence, 0);
-        assert_eq!(u32::from_be_bytes(payload[24..28].try_into().unwrap()), 77);
-        drop(packet);
+        let packet = tcp_packet(&pool, 50_000, 77);
+        let expected = packet.as_slice().to_vec();
+        let (worker, _worker_latency, _worker_priority, worker_bulk) = channels(0, 4);
+        dispatcher.register(worker);
+        dispatcher.dispatch(&mut FastPathScheduler::new(), packet);
+        let sent = worker_bulk.try_recv().unwrap();
+        assert_eq!(sent.as_slice(), expected.as_slice());
+        assert_eq!(sent.as_slice()[0], 0x45);
+        assert!(!sent.as_slice().starts_with(b"CQF1"));
+        drop(sent);
         assert_eq!(pool.available(), pool.capacity());
+    }
+
+    #[test]
+    fn oversized_uplink_uses_server_compatible_fragments() {
+        let (dispatcher, _latency, _priority, _bulk) = test_dispatcher();
+        let pool = PacketPool::new(1);
+        let packet = tcp_packet_len(&pool, 50_000, 77, 1500);
+        let expected = packet.as_slice().to_vec();
+        let (worker, _worker_latency, _worker_priority, worker_bulk) = channels(0, 4);
+        dispatcher.register(worker);
+        dispatcher.dispatch(&mut FastPathScheduler::new(), packet);
+        let first = worker_bulk.try_recv().unwrap();
+        let second = worker_bulk.try_recv().unwrap();
+        assert_eq!(first.len(), 1280);
+        assert_eq!(second.len(), 236);
+        assert_eq!(first.as_slice()[0], crate::wire_protocol::CSQTT_FRAG_MAGIC);
+        assert_eq!(second.as_slice()[0], crate::wire_protocol::CSQTT_FRAG_MAGIC);
+        let mut reassembler = crate::wire_protocol::Reassembler::new();
+        let mut recovered = Vec::new();
+        let now = std::time::Instant::now();
+        assert!(
+            !reassembler
+                .process_fragment_from(0, second.as_slice(), now, |data| recovered = data.to_vec())
+        );
+        assert!(
+            reassembler
+                .process_fragment_from(0, first.as_slice(), now, |data| recovered = data.to_vec())
+        );
+        assert_eq!(recovered, expected);
+        assert!(worker_bulk.try_recv().is_none());
+    }
+
+    #[test]
+    fn fragmented_downlink_is_reassembled_before_returning_ip() {
+        let (dispatcher, _latency, _priority, bulk) = test_dispatcher();
+        let pool = PacketPool::new(1);
+        let packet = tcp_packet_len(&pool, 50_000, 77, crate::wire_protocol::MAX_PACKET_LEN);
+        let expected = packet.as_slice().to_vec();
+        let mut fragments = Vec::new();
+        crate::wire_protocol::fragment_packet(17, &expected, |fragment| {
+            fragments.push(fragment.to_vec())
+        });
+        dispatcher.handle_incoming_fragment(&fragments[1]);
+        assert!(bulk.try_recv().is_none());
+        dispatcher.handle_incoming_fragment(&fragments[0]);
+        assert_eq!(bulk.try_recv().unwrap().as_slice(), expected.as_slice());
+        assert!(bulk.try_recv().is_none());
+    }
+
+    #[test]
+    fn buffer_deficit_drops_entire_uplink_fragment_set() {
+        let (mut dispatcher, _latency, _priority, _bulk) = test_dispatcher();
+        Arc::get_mut(&mut dispatcher).unwrap().pool = PacketPool::new(1);
+        let pool = PacketPool::new(1);
+        let packet = tcp_packet_len(&pool, 50_000, 77, 1500);
+        let (worker, _worker_latency, _worker_priority, worker_bulk) = channels(0, 4);
+        dispatcher.register(worker);
+        dispatcher.dispatch(&mut FastPathScheduler::new(), packet);
+        assert!(worker_bulk.try_recv().is_none());
+        assert_eq!(pool.available(), pool.capacity());
+        assert_eq!(dispatcher.pool.available(), dispatcher.pool.capacity());
     }
 
     #[test]

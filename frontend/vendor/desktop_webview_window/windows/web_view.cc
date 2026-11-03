@@ -8,6 +8,8 @@
 #include <windows.h>
 
 #include <cassert>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <string>
@@ -20,6 +22,19 @@
 #include "utils.h"
 
 namespace webview_window {
+
+// Diagnostic metadata only: no URLs, cookies, page contents or credentials.
+static void TraceNavigation(const char* stage, long code = 0) {
+  if (!GetEnvironmentVariableW(L"FOCSQ_WEBVIEW_DIAGNOSTICS", nullptr, 0)) return;
+  wchar_t temp[MAX_PATH];
+  const DWORD length = GetTempPathW(MAX_PATH, temp);
+  if (!length || length >= MAX_PATH) return;
+  std::ofstream log(std::filesystem::path(temp) / L"focsq-webview-navigation.log",
+                    std::ios::app);
+  log << GetTickCount64() << " pid=" << GetCurrentProcessId()
+      << " " << stage << " code=" << code << "\n";
+}
+
 
 static LRESULT CALLBACK WndProc(HWND const window, UINT const message,
                                 WPARAM const wparam,
@@ -46,53 +61,66 @@ WebView::WebView(
       HWND_MESSAGE, nullptr, ::GetModuleHandle(nullptr), nullptr));
   assert(view_window_ != nullptr);
   if (!view_window_) {
-    on_web_view_created_callback_(S_FALSE);
+    FinishCreation(HRESULT_FROM_WIN32(GetLastError()));
     return;
   }
 
-  CreateCoreWebView2EnvironmentWithOptions(
+  const HRESULT environment_result = CreateCoreWebView2EnvironmentWithOptions(
       nullptr, user_data_folder_.c_str(), nullptr,
       Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
           [this](HRESULT result, ICoreWebView2Environment *env) -> HRESULT {
-            if (!SUCCEEDED(result)) {
-              on_web_view_created_callback_(result);
+            if (FAILED(result) || !env) {
+              FinishCreation(FAILED(result) ? result : E_POINTER);
               return S_OK;
             }
-            env->CreateCoreWebView2Controller(
+            const HRESULT controller_result = env->CreateCoreWebView2Controller(
                 view_window_.get(),
-                Callback<
-                    ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
+                Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
                     [this](HRESULT result,
                            ICoreWebView2Controller *controller) -> HRESULT {
-                      on_web_view_created_callback_(result);
-                      if (SUCCEEDED(result)) {
-                        webview_controller_ = controller;
-                        OnWebviewControllerCreated();
+                      if (FAILED(result) || !controller) {
+                        FinishCreation(FAILED(result) ? result : E_POINTER);
+                        return S_OK;
                       }
+                      webview_controller_ = controller;
+                      // Dart can issue launch as soon as creation completes.
+                      // Do not signal readiness until the WebView exists.
+                      const HRESULT initialized = OnWebviewControllerCreated();
+                      FinishCreation(initialized);
                       return S_OK;
-                    })
-                    .Get());
+                    }).Get());
+            if (FAILED(controller_result)) {
+              FinishCreation(controller_result);
+            }
             return S_OK;
-          })
-          .Get());
+          }).Get());
+  if (FAILED(environment_result)) {
+    FinishCreation(environment_result);
+  }
 }
 
-void WebView::OnWebviewControllerCreated() {
+void WebView::FinishCreation(HRESULT result) {
+  // The owner can destroy this WebView on failure; retain the callback locally.
+  auto callback = std::move(on_web_view_created_callback_);
+  if (callback) callback(result);
+}
+
+HRESULT WebView::OnWebviewControllerCreated() {
   if (!webview_controller_) {
-    return;
+    return E_UNEXPECTED;
   }
   
   HRESULT hr = webview_controller_->get_CoreWebView2(&webview_);
   if (FAILED(hr) || !webview_) {
     std::cerr << "failed to get core webview" << std::endl;
-    return;
+    return FAILED(hr) ? hr : E_POINTER;
   }
 
   wil::com_ptr<ICoreWebView2Settings> settings;
   hr = webview_->get_Settings(&settings);
   if (FAILED(hr) || !settings) {
     std::cerr << "failed to get settings" << std::endl;
-    return;
+    return FAILED(hr) ? hr : E_POINTER;
   }
   
   settings->put_IsScriptEnabled(true);
@@ -166,7 +194,9 @@ void WebView::OnWebviewControllerCreated() {
                      flutter::EncodableValue(web_view_id_)},
                 }));
 
-            if (triggerOnUrlRequestedEvent) {
+            TraceNavigation(triggerOnUrlRequestedEvent && !allow_next_replayed_navigation_
+                                ? "navigation-filter" : "navigation-allow");
+            if (triggerOnUrlRequestedEvent && !allow_next_replayed_navigation_) {
               wil::unique_cotaskmem_string uri;
               HRESULT hr = args->get_Uri(&uri);
               if (FAILED(hr) || !uri) {
@@ -186,9 +216,13 @@ void WebView::OnWebviewControllerCreated() {
                             std::holds_alternative<bool>(*success_value)) {
                           letPass = std::get<bool>(*success_value);
                         }
+                        TraceNavigation(letPass ? "filter-approved" : "filter-declined");
                         if (letPass) {
-                          this->setTriggerOnUrlRequestedEvent(false);
-                          sender->Navigate(uri_string.c_str());
+                          // Bypass this replay once without changing the configured policy.
+                          allow_next_replayed_navigation_ = true;
+                          if (FAILED(sender->Navigate(uri_string.c_str()))) {
+                            allow_next_replayed_navigation_ = false;
+                          }
                         }
                       },
                       nullptr, nullptr);
@@ -210,7 +244,7 @@ void WebView::OnWebviewControllerCreated() {
               args->put_Cancel(true);
             } else {
               args->put_Cancel(false);
-              triggerOnUrlRequestedEvent = true;
+              allow_next_replayed_navigation_ = false;
             }
             return S_OK;
           })
@@ -220,6 +254,11 @@ void WebView::OnWebviewControllerCreated() {
       Callback<ICoreWebView2NavigationCompletedEventHandler>(
           [this](ICoreWebView2 *sender,
                  ICoreWebView2NavigationCompletedEventArgs *args) {
+            BOOL succeeded = FALSE;
+            COREWEBVIEW2_WEB_ERROR_STATUS status = COREWEBVIEW2_WEB_ERROR_STATUS_UNKNOWN;
+            args->get_IsSuccess(&succeeded);
+            args->get_WebErrorStatus(&status);
+            TraceNavigation(succeeded ? "navigation-completed" : "navigation-failed", status);
             auto method_args = flutter::EncodableMap{
                 {flutter::EncodableValue("id"),
                  flutter::EncodableValue(web_view_id_)},
@@ -262,6 +301,7 @@ void WebView::OnWebviewControllerCreated() {
           })
           .Get(),
       nullptr);
+  return S_OK;
 }
 
 void WebView::UpdateBounds() {
@@ -272,12 +312,11 @@ void WebView::UpdateBounds() {
     webview_controller_->put_Bounds(bounds);
 }
 
-void WebView::Navigate(const std::wstring &url) {
-  if (webview_) {
-    webview_->Navigate(url.c_str());
-  } else {
-    std::cerr << "webview not created" << std::endl;
-  }
+HRESULT WebView::Navigate(const std::wstring &url) {
+  if (!webview_) return E_UNEXPECTED;
+  const HRESULT hr = webview_->Navigate(url.c_str());
+  TraceNavigation("navigate-requested", hr);
+  return hr;
 }
 
 void WebView::AddScriptToExecuteOnDocumentCreated(
@@ -466,27 +505,31 @@ bool WebView::CanGoForward() const {
 void WebView::ExecuteJavaScript(
     const std::wstring &javaScript,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> completer) {
-  if (webview_) {
-    webview_->ExecuteScript(
-        javaScript.c_str(),
-        Callback<ICoreWebView2ExecuteScriptCompletedHandler>(
-            [completer(std::move(completer))](HRESULT error,
-                                              PCWSTR result) -> HRESULT {
-              if (error != S_OK) {
-                completer->Error("0", "Error executing JavaScript");
-              } else {
-                if (result) {
-                  completer->Success(flutter::EncodableValue(
-                      wide_to_utf8(std::wstring(result))));
-                } else {
-                  completer->Success(flutter::EncodableValue(""));
-                }
-              }
-              return S_OK;
-            })
-            .Get());
-  } else {
-    completer->Error("0", "webview not created");
+  if (!webview_) {
+    completer->Error("webview_not_ready", "WebView2 is not ready");
+    return;
+  }
+  auto result = std::shared_ptr<flutter::MethodResult<flutter::EncodableValue>>(
+      std::move(completer));
+  const HRESULT started = webview_->ExecuteScript(
+      javaScript.c_str(),
+      Callback<ICoreWebView2ExecuteScriptCompletedHandler>(
+          [result](HRESULT error, PCWSTR value) -> HRESULT {
+            if (FAILED(error)) {
+              result->Error(
+                  "webview_script_" + std::to_string(static_cast<unsigned long>(error)),
+                  "WebView2 script execution failed");
+            } else {
+              result->Success(flutter::EncodableValue(
+                  value ? wide_to_utf8(std::wstring(value)) : ""));
+            }
+            return S_OK;
+          }).Get());
+  // Synchronous failure does not schedule the completion handler.
+  if (FAILED(started)) {
+    result->Error(
+        "webview_script_" + std::to_string(static_cast<unsigned long>(started)),
+        "WebView2 could not start script execution");
   }
 }
 
@@ -520,6 +563,7 @@ void WebView::PostWebMessageAsJson(
 
 void WebView::setTriggerOnUrlRequestedEvent(const bool value) {
   this->triggerOnUrlRequestedEvent = value;
+  allow_next_replayed_navigation_ = false;
 }
 
 WebView::~WebView() {

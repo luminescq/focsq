@@ -1,4 +1,4 @@
-﻿// SPDX-FileCopyrightText: 2026 luminescq
+// SPDX-FileCopyrightText: 2026 luminescq
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 import 'dart:async';
 
@@ -134,6 +134,17 @@ class _LogsScreenState extends State<LogsScreen> {
     );
   }
 
+  Future<void> _copyDiagnosticPath(String path) async {
+    await Clipboard.setData(ClipboardData(text: path));
+    if (!mounted) return;
+    CustomAlert.show(
+      context,
+      title: 'Путь скопирован',
+      message: 'Подробный журнал: $path',
+      type: AlertType.success,
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return ScreenLayout(
@@ -159,7 +170,71 @@ class _LogsScreenState extends State<LogsScreen> {
           onTap: LogService().clear,
         ),
       ],
-      child: _LogsPanel(controller: _scrollController, query: _query),
+      child: Column(
+        children: [
+          ListenableBuilder(
+            listenable: LogService(),
+            builder: (context, _) {
+              final path = LogService().diagnosticFilePath;
+              if (path == null || path.isEmpty) return const SizedBox.shrink();
+              return Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: PanelContainer(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 14,
+                    vertical: 8,
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(
+                        Icons.description_outlined,
+                        size: 18,
+                        color: AppColors.textSecondary,
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text(
+                              'Подробный журнал',
+                              style: TextStyle(
+                                color: AppColors.textPrimary,
+                                fontSize: 12,
+                              ),
+                            ),
+                            const SizedBox(height: 3),
+                            SelectableText(
+                              path,
+                              maxLines: 2,
+                              style: const TextStyle(
+                                color: AppColors.textSecondary,
+                                fontSize: 11,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      IconButton(
+                        tooltip: 'Копировать путь к подробному журналу',
+                        icon: const Icon(
+                          Icons.copy,
+                          size: 18,
+                          color: AppColors.textSecondary,
+                        ),
+                        onPressed: () => _copyDiagnosticPath(path),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            },
+          ),
+          Expanded(
+            child: _LogsPanel(controller: _scrollController, query: _query),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -307,10 +382,20 @@ class _ParsedLogLine {
     final lowerTag = (tag ?? '').toLowerCase();
     final lowerBody = body.toLowerCase();
 
+    if ((lowerTag == 'turn' || lowerTag == 'handshake') &&
+        RegExp(r'\bstage=').hasMatch(lowerBody)) {
+      if (LogService.isErrorLine(rawLine)) return _LogLevel.error;
+      if (RegExp(r'\bstage=(?:[a-z0-9]+_)*(?:ok|ready)\b')
+          .hasMatch(lowerBody)) {
+        return _LogLevel.ok;
+      }
+      return _LogLevel.info;
+    }
+
     if (lowerTag.contains('err') ||
         lowerTag.contains('ошибк') ||
         lowerTag.contains('фатал') ||
-        lower.contains('fatal_auth') ||
+        lower.contains('fatal_') ||
         lower.contains('невосстановим') ||
         lowerBody.contains('ошибка') ||
         lowerBody.contains('error') ||
@@ -413,9 +498,8 @@ class _LogsPanelState extends State<_LogsPanel> {
             thickness: 6,
             interactive: true,
             child: ScrollConfiguration(
-              behavior: ScrollConfiguration.of(
-                context,
-              ).copyWith(scrollbars: false),
+              behavior: ScrollConfiguration.of(context)
+                  .copyWith(scrollbars: false),
               child: ListView.separated(
                 controller: widget.controller,
                 physics: const BouncingScrollPhysics(),
@@ -625,9 +709,8 @@ class _LogLineItem extends StatelessWidget {
     }
 
     if (entry.tag == 'СТАТУС') {
-      final match = RegExp(
-        r'^(Подключено\s*·\s*потоков\s*)(\d+)(.*)$',
-      ).firstMatch(entry.body);
+      final match = RegExp(r'^(Подключено\s*·\s*потоков\s*)(\d+)(.*)$')
+          .firstMatch(entry.body);
       if (match != null) {
         return RichText(
           text: TextSpan(
@@ -666,7 +749,6 @@ class _LogLineItem extends StatelessWidget {
     );
   }
 }
-
 
 class _ActionIcon extends StatefulWidget {
   final String asset;

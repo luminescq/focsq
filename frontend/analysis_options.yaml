@@ -19,6 +19,9 @@ analyzer:
     # uri_does_not_exist. Сам cargokit делает свой dart pub get при
     # запуске — анализировать его код нашим analyze не нужно.
     - rust_builder/cargokit/**
+    - build/**
+    - windows/**
+    - linux/**
 
 linter:
   # The lint rules applied to this project can be customized in the

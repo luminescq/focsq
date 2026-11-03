@@ -951,6 +951,7 @@ async fn cancelled_before_first_control_send_never_creates_allocation() {
         terminal_present: AtomicBool::new(false),
         control_sent: AtomicBool::new(false),
         channel: AtomicU16::new(0),
+        ingress: TurnIngressCounters::default(),
         queue_full_drops: AtomicU64::new(0),
         pool_deficit_drops: AtomicU64::new(0),
         native_pumps: AtomicU64::new(0),
