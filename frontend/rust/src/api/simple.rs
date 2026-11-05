@@ -36,6 +36,11 @@ pub fn set_wintun_dll_path(path: String) {
     let _ = path;
 }
 
+/// [FOCSQ] Только полные пути запущенных EXE для списка split tunnelling.
+pub fn list_running_apps() -> Vec<String> {
+    csqtt_core::list_running_apps()
+}
+
 /// Команда управления ядром ("PAUSE", "RESUME", "PATH_VALIDATE:", "CAPTCHA_RESULT|...")
 pub fn send_control_command(command: String) -> bool {
     csqtt_core::submit_control_line(command)
@@ -72,6 +77,8 @@ pub struct AppClientConfig {
     pub tun_uds: String,
     pub validate_vk_hashes: bool,
     pub vk_js_token: String,
+    /// [FOCSQ] JSON версии 1 с независимыми правилами приложений, доменов и IP.
+    pub split_tunnel: String,
 }
 
 impl Into<ClientConfig> for AppClientConfig {
@@ -97,6 +104,8 @@ impl Into<ClientConfig> for AppClientConfig {
             tun_uds: self.tun_uds,
             validate_vk_hashes: self.validate_vk_hashes,
             vk_js_token: self.vk_js_token,
+            // [FOCSQ] Передаём одну копию правил в новую сессию ядра.
+            split_tunnel: self.split_tunnel,
         }
     }
 }

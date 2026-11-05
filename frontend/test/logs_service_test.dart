@@ -43,6 +43,17 @@ void main() {
   });
 
   group('закрытие диагностического вывода', () {
+    // [FOCSQ] Ошибка прямого пути не должна исчезать из обычного журнала или выглядеть успехом.
+    test('split routing and relay failures remain visible in normal mode', () {
+      final logs = LogService();
+      logs.add('[SPLIT] path=Direct flows=1');
+      logs.add('[SPLIT] stage=tcp_connect destination=192.0.2.1:443 failures=1: connect failed');
+      expect(logs.lines.any((line) => line.contains('path=Direct')), isTrue);
+      expect(logs.lines.any((line) => line.contains('stage=tcp_connect')), isTrue);
+      expect(LogService.isErrorLine('[SPLIT] stage=tcp_connect failures=1'), isTrue);
+      expect(LogService.isErrorLine('[SPLIT] stage=tcp_connect failures=0'), isFalse);
+    });
+
     test('ожидает запись и отсоединяет writer перед закрытием', () async {
       final logs = LogService();
       final disk = <String>[];

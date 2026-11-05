@@ -170,7 +170,8 @@ class LogService extends ChangeNotifier {
   static bool isErrorLine(String line) {
     final lower = line.toLowerCase();
     final stage = RegExp(r'\bstage=([a-z0-9_]+)').firstMatch(lower)?.group(1);
-    if (stage != null && RegExp(r'\[(?:turn|handshake)\]').hasMatch(lower)) {
+    // [FOCSQ] У прямого split relay те же этапы и ненулевые счётчики ошибок.
+    if (stage != null && RegExp(r'\[(?:turn|handshake|split)\]').hasMatch(lower)) {
       if (RegExp(
             r'(?:^|_)(?:error|failed|failure|timeout|denied|refused|reject|rejected)(?:_|$)',
           ).hasMatch(stage) ||
@@ -520,6 +521,8 @@ class LogService extends ChangeNotifier {
     }
 
     const keepPrefixes = [
+      // [FOCSQ] Правила, отказы определения EXE и ошибки direct видны в обычном журнале.
+      '[SPLIT]',
       '[КОННЕКТ]',
       '[ЯДРО]',
       '[ОКНО]',

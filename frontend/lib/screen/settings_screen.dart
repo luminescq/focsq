@@ -11,12 +11,16 @@ import '../theme/app_icons.dart';
 import '../models/app_settings.dart';
 import '../service/autostart.dart';
 import '../service/db.dart';
+// [FOCSQ] Список EXE загружается через уже используемый приложением Rust-мост.
+import '../service/connect.dart';
 import '../service/logs.dart';
 import '../service/tray_service.dart';
 import '../service/update.dart';
 import '../service/vk/token.dart';
 import '../widgets/custom_alert.dart';
 import '../widgets/app_scrollbar.dart';
+// [FOCSQ] Редактор приложений/доменов/IP хранит правила отдельно от общих настроек Isar.
+import '../widgets/split_tunnel_card.dart';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
@@ -283,6 +287,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           ),
                           const SizedBox(height: 8),
                         ],
+
+                        // [FOCSQ] Изменения split tunnelling применяются при следующем подключении.
+                        SplitTunnelCard(
+                          loadApplications: ConnectService().listSplitApplications,
+                        ),
+                        const SizedBox(height: 8),
 
                         _SettingsRow(
                           title: 'Режим работы',

@@ -390,6 +390,9 @@ fn interleave_turn_paths(workers: &mut Vec<WorkerChannels>) {
 }
 
 pub struct Dispatcher {
+    // [FOCSQ] Прямой путь существует только при включённых правилах текущей сессии.
+    #[cfg(windows)]
+    split: Option<Arc<crate::split_tunnel::Router>>,
     workers: ArcSwap<Vec<WorkerChannels>>,
     pool: Arc<PacketPool>,
     fragment_reassembler: crate::wire_protocol::ShardedReassembler,
@@ -452,6 +455,29 @@ impl Dispatcher {
         stats: Arc<Stats>,
         cancel: CancellationToken,
     ) -> Result<(Arc<Self>, String)> {
+        // [FOCSQ] Внутренние тесты и UDP-хост сохраняют прежний режим полного туннеля.
+        Self::start_with_split(listen, tun_uds, pool, stats, cancel, crate::split_tunnel::Config::default()).await
+    }
+
+    pub async fn start_with_split(
+        listen: &str,
+        tun_uds: Option<String>,
+        pool: Arc<PacketPool>,
+        stats: Arc<Stats>,
+        cancel: CancellationToken,
+        split_config: crate::split_tunnel::Config,
+    ) -> Result<(Arc<Self>, String)> {
+        // [FOCSQ] Сохраняем исходные DNS до изменения интерфейса; пустая политика не создаёт relay.
+        #[cfg(windows)]
+        let (split, split_inbound) = if split_config.enabled() {
+            if tun_uds.as_deref() != Some("wintun") { anyhow::bail!("Split tunnelling требует Wintun"); }
+            let (router, inbound) = crate::split_tunnel::Router::new(split_config, pool.clone(), cancel.clone())?;
+            router.warm_dns(&cancel).await;
+            router.start_dns_refresh();
+            (Some(router), Some(inbound))
+        } else { (None, None) };
+        #[cfg(not(windows))]
+        if split_config.enabled() { anyhow::bail!("Split tunnelling пока доступен только на Windows"); }
         let tun_mode = tun_uds.is_some();
         let (return_latency_tx, return_latency_rx) =
             packet_channel(RETURN_LATENCY_CAPACITY, !tun_mode);
@@ -459,6 +485,8 @@ impl Dispatcher {
             packet_channel(RETURN_PRIORITY_CAPACITY, !tun_mode);
         let (return_tx, return_rx) = packet_channel(RETURN_BULK_CAPACITY, !tun_mode);
         let dispatcher = Arc::new(Self {
+            #[cfg(windows)]
+            split,
             workers: ArcSwap::from_pointee(Vec::new()),
             pool: pool.clone(),
             fragment_reassembler: crate::wire_protocol::ShardedReassembler::new(),
@@ -469,6 +497,24 @@ impl Dispatcher {
             cancel: cancel.clone(),
             tasks: tokio::sync::Mutex::new(Vec::new()),
         });
+        // [FOCSQ] Ответы прямого relay идут в ту же очередь Wintun и DNS-наблюдатель, что серверные.
+        #[cfg(windows)]
+        if let Some(mut inbound) = split_inbound {
+            let weak = Arc::downgrade(&dispatcher);
+            let inbound_cancel = cancel.clone();
+            let task = tokio::spawn(async move {
+                loop {
+                    let packet = tokio::select! {
+                        biased;
+                        _ = inbound_cancel.cancelled() => break,
+                        packet = inbound.recv() => packet,
+                    };
+                    let (Some(packet), Some(dispatcher)) = (packet, weak.upgrade()) else { break; };
+                    dispatcher.return_packet(packet);
+                }
+            });
+            dispatcher.tasks.lock().await.push(task);
+        }
         if let Some(name) = tun_uds {
             // [FOCSQ] Десктоп-порт: TUN открываем САМИ (Android-модель
             // с получением FD по UDS отсюда вырезана — ей нужен хост-приложение
@@ -605,6 +651,9 @@ impl Dispatcher {
     }
 
     pub fn return_packet(&self, packet: PacketBuf) {
+        // [FOCSQ] Ответ DNS связывает домен с IPv4 до открытия следующего TCP/UDP потока.
+        #[cfg(windows)]
+        if let Some(router) = &self.split { router.observe_inbound(packet.as_slice()); }
         client_perf::measure_sampled(PerfStage::ReaderReturn, 64, || {
             let sender = match packet_class(packet.as_slice()) {
                 PacketClass::Small => &self.return_latency_tx,
@@ -1221,6 +1270,8 @@ impl Dispatcher {
         let reader_dispatcher = self.clone();
         let reader_cancel = self.cancel.clone();
         let read_stats = stats.clone();
+        // [FOCSQ] Читатель — отдельный OS-поток; async relay выполняется на runtime ядра.
+        let split_runtime = tokio::runtime::Handle::current();
         std::thread::Builder::new()
             .name("csqtt-wintun-reader".to_owned())
             .spawn(move || {
@@ -1246,6 +1297,9 @@ impl Dispatcher {
                             read_stats
                                 .total_bytes_up
                                 .fetch_add(bytes.len() as i64, Ordering::Relaxed);
+                            if let Some(router) = &reader_dispatcher.split {
+                                if split_runtime.block_on(router.route_outbound(packet.as_slice())) { continue; }
+                            }
                             reader_dispatcher.dispatch(&mut scheduler, packet);
                         }
                         Err(error) => {
@@ -1577,6 +1631,9 @@ mod tests {
         let pool = PacketPool::new(128);
         (
             Arc::new(Dispatcher {
+                // [FOCSQ] Изолированные тесты очередей не открывают прямые сетевые потоки.
+                #[cfg(windows)]
+                split: None,
                 workers: ArcSwap::from_pointee(Vec::new()),
                 pool: pool.clone(),
                 fragment_reassembler: crate::wire_protocol::ShardedReassembler::new(),

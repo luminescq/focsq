@@ -15,6 +15,8 @@ import 'captcha.dart';
 import 'db.dart';
 import 'import.dart';
 import 'logs.dart';
+// [FOCSQ] Редактор и запуск читают один атомарно сохранённый файл правил.
+import 'split_tunnel.dart';
 import 'tun_rights.dart';
 import 'vk/auto_calls.dart';
 import 'vk/token.dart';
@@ -153,6 +155,12 @@ class ConnectService extends ChangeNotifier {
     }
   }
 
+  // [FOCSQ] Общая инициализация моста предотвращает гонку выбора EXE и подключения.
+  Future<List<String>> listSplitApplications() async {
+    await _ensureRust();
+    return rust.listRunningApps();
+  }
+
   Future<void> _ensureRust() {
     final existing = _rustInitFuture;
     if (existing != null) return existing;
@@ -236,6 +244,12 @@ class ConnectService extends ChangeNotifier {
     // Reject legacy profiles before creating VK calls or starting the core.
     final workerIssue = workerCountIssue(profile.power);
     if (workerIssue != null) return workerIssue;
+    // [FOCSQ] Повреждённые правила не подменяем полным туннелем и проверяем до VK-звонков.
+    final splitSettings = await SplitTunnelStore.load();
+    final splitConfig = splitSettings.toJsonString();
+    if (splitSettings.enabled && !Platform.isWindows) {
+      return 'Split tunnelling пока доступен только на Windows';
+    }
 
     if (Platform.isWindows) {
       if (!_isAdmin()) {
@@ -337,6 +351,8 @@ class ConnectService extends ChangeNotifier {
       tunUds: _tunMode,
       validateVkHashes: false,
       vkJsToken: vkToken ?? '',
+      // [FOCSQ] Копия правил закрепляется за новой сессией до переподключения.
+      splitTunnel: splitConfig,
     );
 
     if (Platform.isWindows) {

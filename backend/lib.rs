@@ -24,6 +24,12 @@ mod repair;
 mod selective_fec;
 mod session;
 mod stats;
+// [FOCSQ] Политика split tunnelling общая, прямой relay и определение EXE — Windows.
+mod split_tunnel;
+#[cfg(windows)]
+mod split_relay;
+#[cfg(windows)]
+mod split_windows;
 #[path = "shared/striped_scheduler.rs"]
 mod striped_scheduler;
 mod stun_codec;
@@ -104,6 +110,8 @@ pub struct ClientConfig {
     pub tun_uds: String,
     pub validate_vk_hashes: bool,
     pub vk_js_token: String,
+    // [FOCSQ] Версионированные правила независимых списков приложений/доменов/IP.
+    pub split_tunnel: String,
 }
 
 impl Default for ClientConfig {
@@ -129,12 +137,22 @@ impl Default for ClientConfig {
             tun_uds: "".to_string(),
             validate_vk_hashes: false,
             vk_js_token: "".to_string(),
+            // [FOCSQ] Старые профили сохраняют полный туннель без дополнительных правил.
+            split_tunnel: String::new(),
         }
     }
 }
 
 pub fn set_log_callback(cb: Box<dyn Fn(String) + Send + Sync>) {
     logging::set_log_callback(cb);
+}
+
+/// [FOCSQ] Список полных EXE для выбора приложений; без чтения командных строк процессов.
+pub fn list_running_apps() -> Vec<String> {
+    #[cfg(windows)]
+    { split_windows::running_apps().into_iter().map(|(_, path)| path).collect() }
+    #[cfg(not(windows))]
+    { Vec::new() }
 }
 
 /// Принудительное включение структурированных событий (__CSQTT_EVENT__|...)
@@ -209,6 +227,10 @@ pub async fn run_client(
     if arguments.validate_vk_hashes {
         return run_vk_hash_validation(&arguments).await;
     }
+    // [FOCSQ] Ошибка правил останавливает запуск до создания VK-звонков и адаптера.
+    let split_config = split_tunnel::Config::parse(&arguments.split_tunnel)?;
+    #[cfg(not(windows))]
+    if split_config.enabled() { bail!("Split tunnelling пока доступен только на Windows"); }
     let js_hash_mode = arguments.vk_hash_mode == "auto_js";
     let js_auth_mode = arguments.vk_auth_mode == "auto_js";
     if js_auth_mode && !js_hash_mode {
@@ -315,12 +337,14 @@ pub async fn run_client(
     #[cfg(not(any(windows, target_os = "linux")))]
     let native_tun = false;
     let tun_peer_ip = native_tun.then(|| peer.ip().to_string());
-    let dispatcher_result = Dispatcher::start(
+    // [FOCSQ] Настройки принадлежат конкретной сессии и не меняют работающие потоки.
+    let dispatcher_result = Dispatcher::start_with_split(
         &arguments.listen,
         tun_uds,
         pool.clone(),
         stats.clone(),
         cancel.clone(),
+        split_config,
     )
     .await;
     let (dispatcher, local_port) = match dispatcher_result {
