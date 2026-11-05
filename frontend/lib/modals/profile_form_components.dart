@@ -1,11 +1,12 @@
-﻿// SPDX-FileCopyrightText: 2026 luminescq
+// SPDX-FileCopyrightText: 2026 luminescq
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 import 'package:flutter/material.dart';
 import '../models/app_settings.dart';
+import '../service/worker_limits.dart';
 import '../theme/app_colors.dart';
 
 int resolveMaxPowerThreads(AppSettings settings) {
-  var max = settings.extraThreads ? 162 : 90;
+  var max = settings.extraThreads ? maxWorkerCount : 90;
   if (settings.hashes == 'Ручной') {
     final hashCount = settings.customHashes
         .split(',')
@@ -259,22 +260,22 @@ class _CustomDropdownState extends State<CustomDropdown>
                     parent: _animationController,
                     curve: Curves.easeOut,
                   ),
-          child: Container(
-            width: 170,
-            decoration: BoxDecoration(
-              color: AppColors.card,
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(
-                color: Colors.white.withValues(alpha: 0.1),
-              ),
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.black.withValues(alpha: 0.5),
-                  blurRadius: 10,
-                  offset: const Offset(0, 4),
-                ),
-              ],
-            ),
+                  child: Container(
+                    width: 170,
+                    decoration: BoxDecoration(
+                      color: AppColors.card,
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(
+                        color: Colors.white.withValues(alpha: 0.1),
+                      ),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withValues(alpha: 0.5),
+                          blurRadius: 10,
+                          offset: const Offset(0, 4),
+                        ),
+                      ],
+                    ),
                     child: ClipRRect(
                       borderRadius: BorderRadius.circular(12),
                       child: Column(

@@ -1,4 +1,4 @@
-﻿// SPDX-FileCopyrightText: 2026 luminescq
+// SPDX-FileCopyrightText: 2026 luminescq
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 import 'dart:async';
 import 'dart:io';
@@ -56,15 +56,17 @@ class TrayService with TrayListener {
       final linux = Platform.isLinux;
       final base = linux
           ? (Platform.environment['XDG_DATA_HOME'] ??
-              '${Platform.environment['HOME']}/.local/share')
+                '${Platform.environment['HOME']}/.local/share')
           : Platform.environment['LOCALAPPDATA'];
-      final dir = Directory('${base ?? Directory.systemTemp.path}'
-          '${Platform.pathSeparator}FOCSQ');
+      final dir = Directory(
+        '${base ?? Directory.systemTemp.path}'
+        '${Platform.pathSeparator}FOCSQ',
+      );
       await dir.create(recursive: true);
-      final asset =
-          linux ? 'assets/tray/tray_static_32.png' : 'assets/tray/tray_static.ico';
-      final fileName =
-          linux ? 'tray_static_32.png' : 'tray_static.ico';
+      final asset = linux
+          ? 'assets/tray/tray_static_32.png'
+          : 'assets/tray/tray_static.ico';
+      final fileName = linux ? 'tray_static_32.png' : 'tray_static.ico';
       final file = File('${dir.path}${Platform.pathSeparator}$fileName');
 
       final data = await rootBundle.load(asset);
@@ -85,8 +87,8 @@ class TrayService with TrayListener {
   Future<void> _updateMenuAndTooltip() async {
     if (!_enabled) return;
     final state = ConnectService().state;
-    final menuConnected = state == ConnectState.connected ||
-        state == ConnectState.connecting;
+    final menuConnected =
+        state == ConnectState.connected || state == ConnectState.connecting;
     final tooltip = 'FOCSQ — ${_statusText()}';
 
     if (menuConnected == _appliedMenuConnected && tooltip == _appliedToolTip) {
@@ -108,23 +110,27 @@ class TrayService with TrayListener {
   }
 
   String _statusText() => switch (ConnectService().state) {
-        ConnectState.connected => 'Подключено',
-        ConnectState.connecting => 'Подключение...',
-        ConnectState.disconnecting => 'Отключение...',
-        ConnectState.disconnected => 'Отключено',
-      };
+    ConnectState.connected => 'Подключено',
+    ConnectState.connecting => 'Подключение...',
+    ConnectState.disconnecting => 'Отключение...',
+    ConnectState.disconnected => 'Отключено',
+  };
 
   Future<void> _setMenu(bool connected) async {
-    await trayManager.setContextMenu(Menu(items: [
-      MenuItem(key: _menuOpen, label: 'Открыть FOCSQ'),
-      MenuItem.separator(),
-      MenuItem(
-        key: _menuToggle,
-        label: connected ? 'Отключиться' : 'Подключиться',
+    await trayManager.setContextMenu(
+      Menu(
+        items: [
+          MenuItem(key: _menuOpen, label: 'Открыть FOCSQ'),
+          MenuItem.separator(),
+          MenuItem(
+            key: _menuToggle,
+            label: connected ? 'Отключиться' : 'Подключиться',
+          ),
+          MenuItem.separator(),
+          MenuItem(key: _menuExit, label: 'Выход'),
+        ],
       ),
-      MenuItem.separator(),
-      MenuItem(key: _menuExit, label: 'Выход'),
-    ]));
+    );
   }
 
   Future<void> showWindow() async {
@@ -133,10 +139,18 @@ class TrayService with TrayListener {
     AppVisibility.instance.setVisible(true);
   }
 
+  static String hiddenStatusFor(ConnectState state) => switch (state) {
+    ConnectState.connected => 'туннель работает',
+    ConnectState.connecting => 'подключение продолжается',
+    ConnectState.disconnecting => 'отключение продолжается',
+    ConnectState.disconnected => 'нет подключения',
+  };
+
   Future<void> hideToTray() async {
     await windowManager.hide();
     AppVisibility.instance.setVisible(false);
-    LogService().add('[СТАТУС] Свёрнуто в трей · туннель работает');
+    final status = hiddenStatusFor(ConnectService().state);
+    LogService().add('[СТАТУС] Свёрнуто в трей · $status');
   }
 
   Future<void> exitApp() async {
@@ -148,20 +162,20 @@ class TrayService with TrayListener {
     try {
       await windowManager.hide();
     } catch (_) {}
-    LogService().add('[КОННЕКТ] Выход: интерфейс скрыт (${sw.elapsedMilliseconds}мс)');
-    if (ConnectService().state != ConnectState.disconnected) {
-      await ConnectService().stop();
-      LogService().add(
-        '[КОННЕКТ] Выход: ядро остановлено (${sw.elapsedMilliseconds}мс)',
-      );
-    }
+    LogService().add(
+      '[КОННЕКТ] Выход: интерфейс скрыт (${sw.elapsedMilliseconds}мс)',
+    );
+    await ConnectService().stop();
+    LogService().add(
+      '[КОННЕКТ] Выход: отмена ядра запрошена (${sw.elapsedMilliseconds}мс)',
+    );
     await ConnectService().waitForExit();
     LogService().add(
       '[КОННЕКТ] Выход: teardown завершён (${sw.elapsedMilliseconds}мс)',
     );
+    await LogService().closeDiagnosticOutput();
     await windowManager.destroy();
   }
-
 
   @override
   void onTrayIconMouseDown() {

@@ -86,7 +86,7 @@ void WebviewWindow::CreateAndShow(const std::wstring &title, int height, int wid
       nullptr, nullptr, GetModuleHandle(nullptr), this));
   }
   if (!hwnd_) {
-    callback(false);
+    callback(HRESULT_FROM_WIN32(GetLastError()));
     return;
   }
 
@@ -103,13 +103,7 @@ void WebviewWindow::CreateAndShow(const std::wstring &title, int height, int wid
   // Create the browser view.
   web_view_ = std::make_unique<webview_window::WebView>(
       method_channel_, window_id_, userDataFolder,
-      [callback](HRESULT hr) {
-        if (SUCCEEDED(hr)) {
-          callback(true);
-        } else {
-          callback(false);
-        }
-      });
+      std::move(callback));
 
   auto web_view_handle = web_view_->NativeWindow().get();
   SetParent(web_view_handle, hwnd_.get());

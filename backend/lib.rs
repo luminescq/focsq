@@ -1,4 +1,4 @@
-﻿// SPDX-FileCopyrightText: 2026 amurcanov
+// SPDX-FileCopyrightText: 2026 amurcanov
 // SPDX-FileCopyrightText: 2026 luminescq
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
@@ -18,37 +18,43 @@ mod namegen;
 mod obfs;
 mod packet;
 mod profiles;
-mod repair;
 mod protocol;
+mod repair;
 #[path = "shared/selective_fec.rs"]
 mod selective_fec;
 mod session;
 mod stats;
+// [FOCSQ] Политика split tunnelling общая, прямой relay и определение EXE — Windows.
+mod split_tunnel;
+#[cfg(windows)]
+mod split_relay;
+#[cfg(windows)]
+mod split_windows;
 #[path = "shared/striped_scheduler.rs"]
 mod striped_scheduler;
 mod stun_codec;
-mod turn_endpoint;
-mod turn_stream;
-mod udp_batch;
 #[cfg(target_os = "linux")]
 // [FOCSQ] Нативный Linux TUN (/dev/net/tun + netlink-маршруты)
 pub mod tun_linux;
-mod turn;
-mod turn_core;
- mod vk_js_calls;
 #[cfg(windows)]
 // [FOCSQ] pub: мост (rust_lib_frontend) вызывает set_dll_path_override
 pub mod tun_win;
+mod turn;
+mod turn_core;
+mod turn_endpoint;
+mod turn_stream;
+mod udp_batch;
+mod vk_js_calls;
 mod worker;
 mod wrap;
 // [FOCSQ] Общие модули апстрима v2.1.9 (shared/): кадрирование потоков
 // и ревизия wire-протокола нужны новому диспетчеру/сессиям
+mod client_perf;
+mod cpu_task;
 #[path = "shared/flow_frame.rs"]
 mod flow_frame;
 #[path = "shared/wire_protocol.rs"]
 mod wire_protocol;
-mod client_perf;
-mod cpu_task;
 
 use anyhow::{Context, Result, bail};
 use auth::{VkAuth, VkHashCheck};
@@ -57,6 +63,8 @@ use dispatcher::Dispatcher;
 use events::Events;
 use obfs::ObfsMode;
 use packet::{PacketPool, packet_pool_size};
+use repair::RepairState;
+use session::ShutdownCoordinator;
 use stats::Stats;
 use std::{
     collections::HashSet,
@@ -68,8 +76,6 @@ use std::{
     time::Duration,
 };
 use tokio_util::sync::CancellationToken;
-use repair::RepairState;
-use session::ShutdownCoordinator;
 use turn_endpoint::TurnTransportMode;
 use worker::{
     GROUPS_PER_CREDENTIAL, GroupContext, PauseGate, RuntimeParams, WORKER_START_INTERVAL,
@@ -78,7 +84,8 @@ use worker::{
 
 const GROUPS_PER_VK_HASH: usize = 3;
 const MAX_VK_HASHES: usize = 6;
-const MAX_WORKERS: usize = MAX_VK_HASHES * GROUPS_PER_VK_HASH * WORKERS_PER_GROUP;
+// CSQTT 2.5 accepts at most 100 streams; allocation uses complete groups of nine.
+const MAX_WORKERS: usize = 99;
 use wrap::derive_wrap_key;
 
 #[derive(Clone, Debug)]
@@ -103,6 +110,8 @@ pub struct ClientConfig {
     pub tun_uds: String,
     pub validate_vk_hashes: bool,
     pub vk_js_token: String,
+    // [FOCSQ] Версионированные правила независимых списков приложений/доменов/IP.
+    pub split_tunnel: String,
 }
 
 impl Default for ClientConfig {
@@ -128,12 +137,22 @@ impl Default for ClientConfig {
             tun_uds: "".to_string(),
             validate_vk_hashes: false,
             vk_js_token: "".to_string(),
+            // [FOCSQ] Старые профили сохраняют полный туннель без дополнительных правил.
+            split_tunnel: String::new(),
         }
     }
 }
 
 pub fn set_log_callback(cb: Box<dyn Fn(String) + Send + Sync>) {
     logging::set_log_callback(cb);
+}
+
+/// [FOCSQ] Список полных EXE для выбора приложений; без чтения командных строк процессов.
+pub fn list_running_apps() -> Vec<String> {
+    #[cfg(windows)]
+    { split_windows::running_apps().into_iter().map(|(_, path)| path).collect() }
+    #[cfg(not(windows))]
+    { Vec::new() }
 }
 
 /// Принудительное включение структурированных событий (__CSQTT_EVENT__|...)
@@ -146,8 +165,7 @@ pub fn set_events_enabled(enabled: bool) {
 }
 
 /// Канал управления активной сессией (замена stdin для встроенного режима)
-static CONTROL_TX: Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>> =
-    Mutex::new(None);
+static CONTROL_TX: Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>> = Mutex::new(None);
 
 fn set_control_channel(tx: tokio::sync::mpsc::UnboundedSender<String>) {
     if let Ok(mut guard) = CONTROL_TX.lock() {
@@ -202,10 +220,17 @@ pub fn submit_captcha_result(result: String) -> bool {
     }
 }
 
-pub async fn run_client(arguments: ClientConfig, external_cancel: Option<CancellationToken>) -> Result<()> {
+pub async fn run_client(
+    arguments: ClientConfig,
+    external_cancel: Option<CancellationToken>,
+) -> Result<()> {
     if arguments.validate_vk_hashes {
         return run_vk_hash_validation(&arguments).await;
     }
+    // [FOCSQ] Ошибка правил останавливает запуск до создания VK-звонков и адаптера.
+    let split_config = split_tunnel::Config::parse(&arguments.split_tunnel)?;
+    #[cfg(not(windows))]
+    if split_config.enabled() { bail!("Split tunnelling пока доступен только на Windows"); }
     let js_hash_mode = arguments.vk_hash_mode == "auto_js";
     let js_auth_mode = arguments.vk_auth_mode == "auto_js";
     if js_auth_mode && !js_hash_mode {
@@ -230,9 +255,13 @@ pub async fn run_client(arguments: ClientConfig, external_cancel: Option<Cancell
         let bootstrap = vk_js_calls::Bootstrap {
             token: arguments.vk_js_token.trim().to_owned(),
         };
-        let started =
-            vk_js_calls::start(bootstrap, &arguments.device_id, js_auth_mode, &session_profile)
-                .await?;
+        let started = vk_js_calls::start(
+            bootstrap,
+            &arguments.device_id,
+            js_auth_mode,
+            &session_profile,
+        )
+        .await?;
         let hashes = started.hashes.join(",");
         js_calls = Some(started.active);
         js_credential_broker = Some(started.credential_broker);
@@ -308,12 +337,14 @@ pub async fn run_client(arguments: ClientConfig, external_cancel: Option<Cancell
     #[cfg(not(any(windows, target_os = "linux")))]
     let native_tun = false;
     let tun_peer_ip = native_tun.then(|| peer.ip().to_string());
-    let dispatcher_result = Dispatcher::start(
+    // [FOCSQ] Настройки принадлежат конкретной сессии и не меняют работающие потоки.
+    let dispatcher_result = Dispatcher::start_with_split(
         &arguments.listen,
         tun_uds,
         pool.clone(),
         stats.clone(),
         cancel.clone(),
+        split_config,
     )
     .await;
     let (dispatcher, local_port) = match dispatcher_result {
@@ -767,6 +798,10 @@ fn print_configuration(
         turn_transport.as_str().to_ascii_uppercase(),
         arguments.obfs
     );
+    crate::log_error!(
+        "[КЛИЕНТ] Совместимость: CSQTT 2.5.0 / {}",
+        wire_protocol::WIRE_PROTOCOL_REVISION
+    );
     crate::log_error!("[WRAP] WRAP Ключ вычислен ✓");
     crate::log_error!("[КЛИЕНТ] Device ID: {}", arguments.device_id);
     crate::log_error!("[КЛИЕНТ] Captcha: {captcha}");
@@ -784,7 +819,7 @@ mod worker_count_tests {
             assert_eq!(normalize_worker_count(workers), workers);
             assert_eq!(workers / WORKERS_PER_GROUP, groups);
         }
-        assert_eq!(normalize_worker_count(MAX_WORKERS), 162);
+        assert_eq!(normalize_worker_count(MAX_WORKERS), 99);
     }
 
     #[test]
@@ -799,28 +834,29 @@ mod worker_count_tests {
     #[test]
     fn hash_count_caps_native_worker_admission_to_twenty_seven_each() {
         assert_eq!(normalize_worker_count_for_hashes(usize::MAX, 1, false), 27);
-        assert_eq!(normalize_worker_count_for_hashes(usize::MAX, 4, false), 108);
-        assert_eq!(normalize_worker_count_for_hashes(usize::MAX, 5, false), 135);
-        assert_eq!(normalize_worker_count_for_hashes(usize::MAX, 6, false), 162);
+        assert_eq!(normalize_worker_count_for_hashes(usize::MAX, 4, false), 99);
+        assert_eq!(normalize_worker_count_for_hashes(usize::MAX, 5, false), 99);
+        assert_eq!(normalize_worker_count_for_hashes(usize::MAX, 6, false), 99);
         assert_eq!(
             normalize_worker_count_for_hashes(usize::MAX, 100, false),
-            162
+            99
         );
     }
 
     #[test]
     fn automatic_call_failure_may_redistribute_complete_groups() {
-        assert_eq!(normalize_worker_count_for_hashes(162, 5, true), 162);
+        assert_eq!(normalize_worker_count_for_hashes(162, 5, true), 99);
         assert_eq!(normalize_worker_count_for_hashes(54, 1, true), 54);
         assert_eq!(normalize_worker_count_for_hashes(50, 1, true), 45);
     }
 
     #[test]
-    fn auto_js_account_auth_supports_nine_credentials_in_one_call() {
-        assert_eq!(normalize_worker_count_for_hashes(162, 1, true), 162);
-        assert_eq!(
-            MAX_WORKERS.div_ceil(worker::WORKERS_PER_CREDENTIAL),
-            vk_js_calls::MAX_ACCOUNT_CREDENTIALS
+    fn auto_js_account_auth_respects_csqtt_250_stream_limit() {
+        assert_eq!(normalize_worker_count_for_hashes(162, 1, true), 99);
+        assert_eq!(MAX_WORKERS.div_ceil(worker::WORKERS_PER_CREDENTIAL), 6);
+        assert!(
+            MAX_WORKERS.div_ceil(worker::WORKERS_PER_CREDENTIAL)
+                <= vk_js_calls::MAX_ACCOUNT_CREDENTIALS
         );
     }
 
@@ -839,8 +875,6 @@ mod worker_count_tests {
         assert_eq!(required_js_ready_bots(3), 2);
         assert_eq!(required_js_ready_bots(18), 2);
     }
-
-
 
     #[tokio::test]
     async fn js_creator_waits_for_every_distinct_ready_credential() {

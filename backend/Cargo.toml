@@ -51,6 +51,9 @@ getrandom = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 wintun = "0.5"
+# [FOCSQ] Пользовательский TCP/IP стек для отдельных прямых потоков без нового драйвера.
+futures = "0.3.34"
+netstack-smoltcp = { path = "vendor/netstack-smoltcp" }
 # [FOCSQ] Нативная установка адреса TUN-адаптера (CreateUnicastIpAddressEntry)
 # вместо netsh set address — единственного вызова, чья консоль мигала над GUI
 windows-sys = { version = "0.52", features = [
@@ -58,6 +61,9 @@ windows-sys = { version = "0.52", features = [
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
+    # [FOCSQ] Владелец сокета и полный путь EXE нужны для правил приложений.
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
 ] }
 
 [target.'cfg(unix)'.dependencies]

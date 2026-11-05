@@ -1,10 +1,16 @@
-﻿// SPDX-FileCopyrightText: 2026 luminescq
+// SPDX-FileCopyrightText: 2026 luminescq
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
+
+class _SafeLogRecord {
+  const _SafeLogRecord(this.line, this.timestamp);
+  final String line;
+  final String timestamp;
+}
 
 class LogService extends ChangeNotifier {
   LogService._();
@@ -20,6 +26,120 @@ class LogService extends ChangeNotifier {
   static bool developerMode = false;
 
   final List<String> _lines = [];
+  final List<_SafeLogRecord> _rawRecords = [];
+  bool _replaying = false;
+  void Function(String)? _diagnosticWriter;
+  Future<void> Function()? _diagnosticClose;
+  Future<void>? _diagnosticClosing;
+  String? _diagnosticFilePath;
+
+  String? get diagnosticFilePath => _diagnosticFilePath;
+
+  /// The writer receives every safe raw event, including hidden/repeated events.
+  void configureDiagnosticOutput({
+    required String? filePath,
+    required void Function(String)? writer,
+    Future<void> Function()? close,
+  }) {
+    _diagnosticFilePath = filePath;
+    _diagnosticWriter = writer;
+    _diagnosticClose = close;
+    _diagnosticClosing = null;
+    notifyListeners();
+  }
+
+  /// Detach output and finish its pending records before the app exits.
+  Future<void> closeDiagnosticOutput() {
+    final closing = _diagnosticClosing;
+    if (closing != null) return closing;
+    final close = _diagnosticClose;
+    _diagnosticWriter = null;
+    _diagnosticClose = null;
+    if (close == null) return Future<void>.value();
+    return _diagnosticClosing = _finishDiagnosticOutput(close);
+  }
+
+  Future<void> _finishDiagnosticOutput(Future<void> Function() close) async {
+    try {
+      await close();
+    } catch (error) {
+      add('[ЖУРНАЛ] Ошибка завершения подробного лога (${error.runtimeType})');
+    }
+  }
+
+  /// Apply once at ingress, before developer mode, the raw ring, or file output.
+  static String redactSecrets(String line) {
+    var safe = line.replaceAllMapped(
+      RegExp(r'\b(GETCONF|DISCONNECT):[^\r\n]+', caseSensitive: false),
+      (match) => '${match.group(1)}:[REDACTED]',
+    );
+    safe = safe.replaceAllMapped(
+      RegExp(r'(CAPTCHA_SOLVE|CAPTCHA_RESULT)\|[^\r\n]+', caseSensitive: false),
+      (match) => '${match.group(1)}|[REDACTED]',
+    );
+    safe = safe.replaceAllMapped(
+      RegExp(r'^\[КРЕД[^\]]*\].*$', caseSensitive: false, multiLine: true),
+      (_) => '[КРЕДЫ] [REDACTED]',
+    );
+    safe = safe.replaceAllMapped(
+      RegExp(
+        r'([a-z][a-z0-9+.-]*://)[^\s/@]+(?::[^\s/@]*)?@',
+        caseSensitive: false,
+      ),
+      (match) => '${match.group(1)}[REDACTED]@',
+    );
+    safe = safe.replaceAllMapped(
+      RegExp(r'\bBearer\s+[^\s,;"\x27]+', caseSensitive: false),
+      (_) => 'Bearer [REDACTED]',
+    );
+    const keys =
+        r'(?:[a-z0-9]+_)*(?:password|passwd|pass|access_token|accesstoken|refresh_token|refreshtoken|id_token|idtoken|anonymtoken|token|credential|credentials|username|user|secret|private_key|wrap_key|key|hash|hashes|joinlink|link|sid)';
+    safe = safe.replaceAllMapped(
+      RegExp(
+        r'''(["']?\b''' + keys + r'''\b["']?\s*[:=]\s*)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\[[^\]]*\]|[^\s&,;|}\]]+)''',
+        caseSensitive: false,
+      ),
+      (match) {
+        final value = match.group(2)!;
+        final marker = value.startsWith('"')
+            ? '"[REDACTED]"'
+            : value.startsWith("'")
+            ? "'[REDACTED]'"
+            : value.startsWith('[')
+            ? '["[REDACTED]"]'
+            : '[REDACTED]';
+        return '${match.group(1)}$marker';
+      },
+    );
+    safe = safe.replaceAllMapped(
+      RegExp(
+        r'((?:access_token|refresh_token|id_token|anonymtoken|token|password|key|hash|joinlink|link|sid)%3d)(?:(?!%26|%23)[^\s&#])*',
+        caseSensitive: false,
+      ),
+      (match) => '${match.group(1)}[REDACTED]',
+    );
+    safe = safe.replaceAllMapped(
+      RegExp(
+        r'''((?:https?://)?(?:www\.)?vk\.com/call/join/)[^\s?&#"'<>]+''',
+        caseSensitive: false,
+      ),
+      (match) => '${match.group(1)}[REDACTED]',
+    );
+    safe = safe.replaceAllMapped(
+      RegExp(
+        r'''((?:https?%3a%2f%2f)?(?:www\.)?vk\.com%2fcall%2fjoin%2f)[^\s&#"'<>]+''',
+        caseSensitive: false,
+      ),
+      (match) => '${match.group(1)}[REDACTED]',
+    );
+    if (safe.contains('FATAL_HANDSHAKE')) {
+      safe = safe.replaceAll(
+        'проверьте пароль подключения и совместимость клиента с сервером',
+        'причина отсутствия ответа пока не установлена',
+      );
+    }
+    return safe;
+  }
 
   int _version = 0;
 
@@ -33,17 +153,40 @@ class LogService extends ChangeNotifier {
     final instance = _instance;
     if (developerMode == value) return;
     developerMode = value;
-    if (instance._lines.isEmpty) return;
-    instance.clear();
-    instance.add(
-      value
-          ? '── Режим разработчика: полные логи ──'
-          : '── Обычный режим логов ──',
-    );
+    // Re-render the safe raw ring; toggling detail must not erase evidence.
+    instance._lines.clear();
+    instance._replaying = true;
+    try {
+      for (final record in instance._rawRecords) {
+        instance._appendVisible(record.line, record.timestamp);
+      }
+    } finally {
+      instance._replaying = false;
+    }
+    instance._version++;
+    instance.notifyListeners();
   }
 
   static bool isErrorLine(String line) {
     final lower = line.toLowerCase();
+    final stage = RegExp(r'\bstage=([a-z0-9_]+)').firstMatch(lower)?.group(1);
+    // [FOCSQ] У прямого split relay те же этапы и ненулевые счётчики ошибок.
+    if (stage != null && RegExp(r'\[(?:turn|handshake|split)\]').hasMatch(lower)) {
+      if (RegExp(
+            r'(?:^|_)(?:error|failed|failure|timeout|denied|refused|reject|rejected)(?:_|$)',
+          ).hasMatch(stage) ||
+          stage == 'no_config') {
+        return true;
+      }
+      final errorValues = RegExp(
+        r'\b(?:[a-z0-9]+_)*(?:errors?|failed|failures?|drops?)\s*=\s*(true|false|[+-]?\d+(?:\.\d+)?)(?=$|[\s,;])',
+      );
+      for (final match in errorValues.allMatches(lower)) {
+        final value = match.group(1)!;
+        if (value == 'true' || (num.tryParse(value) ?? 0) > 0) return true;
+      }
+      return RegExp(r'\bfatal(?:_|\b)|✗').hasMatch(lower);
+    }
     return lower.contains('ошибка') ||
         lower.contains('error') ||
         lower.contains('фатал') ||
@@ -51,6 +194,10 @@ class LogService extends ChangeNotifier {
         lower.contains('failed') ||
         lower.contains('refused') ||
         lower.contains('timeout') ||
+        lower.contains('таймаут') ||
+        lower.contains('тайм-аут') ||
+        lower.contains('нет ответа') ||
+        lower.contains('не подтвердил') ||
         lower.contains('не удалась') ||
         lower.contains('недоступен') ||
         lower.contains('✗');
@@ -74,12 +221,27 @@ class LogService extends ChangeNotifier {
   }
 
   static String? _resolveKey(String body) {
+    if (body.contains('FATAL_HANDSHAKE')) {
+      final peer = RegExp(r'\bpeer=([^\s,;]+)').firstMatch(body)?.group(1);
+      var cause = body.substring(
+        body.indexOf('FATAL_HANDSHAKE') + 'FATAL_HANDSHAKE'.length,
+      );
+      cause = cause
+          .replaceAll(
+            RegExp(r'\bworker\s*=\s*\d+', caseSensitive: false),
+            'worker=*',
+          )
+          .replaceAll(RegExp(r'\s+'), ' ')
+          .trim();
+      return 'handshake_timeout:${peer ?? "current"}:$cause';
+    }
     if (body.startsWith('[ВОРКЕР] Поток готов')) return 'worker_ready';
     if (body.startsWith('[СЕТЬ]')) return 'network_stats';
     if (body.startsWith('[TURN]')) {
       if (body.contains('CreatePermission')) return 'turn_permission';
       if (body.contains('ChannelBind')) return 'turn_channel';
-      if (body.contains('Сессия готова') || body.contains('готова к передаче')) {
+      if (body.contains('Сессия готова') ||
+          body.contains('готова к передаче')) {
         return 'turn_ready';
       }
       if (body.contains('Refresh аллокации')) return 'turn_refresh';
@@ -104,8 +266,9 @@ class LogService extends ChangeNotifier {
   }
 
   int _findLineByKey(String key) {
-    final start =
-        _lines.length > _keyedScanWindow ? _lines.length - _keyedScanWindow : 0;
+    final start = _lines.length > _keyedScanWindow
+        ? _lines.length - _keyedScanWindow
+        : 0;
     for (var i = _lines.length - 1; i >= start; i--) {
       final body = _extractBody(_lines[i]);
       if (_resolveKey(body) == key) {
@@ -118,28 +281,61 @@ class LogService extends ChangeNotifier {
   void add(String line) {
     final trimmed = line.trim();
     if (trimmed.isEmpty) return;
+    final safe = redactSecrets(trimmed);
+    final timestamp = _timestamp();
+    _rawRecords.add(_SafeLogRecord(safe, timestamp));
+    if (_rawRecords.length > maxLines) {
+      _rawRecords.removeRange(0, _rawRecords.length - maxLines);
+    }
+    final writer = _diagnosticWriter;
+    if (writer != null) {
+      try {
+        writer('[${DateTime.now().toUtc().toIso8601String()}] $safe');
+      } catch (error) {
+        // A failing disk sink must not break connection handling or recurse.
+        _diagnosticWriter = null;
+        final failure =
+            '[ЛОГ] Ошибка записи подробного журнала (${error.runtimeType})';
+        _rawRecords.add(_SafeLogRecord(failure, timestamp));
+        if (_rawRecords.length > maxLines) _rawRecords.removeAt(0);
+        _appendVisible(failure, timestamp);
+      }
+    }
+    _appendVisible(safe, timestamp);
+  }
 
-    final visible = developerMode ? trimmed : _userLine(trimmed);
+  void _appendVisible(String safe, String timestamp) {
+    final visible = developerMode ? safe : _userLine(safe);
     if (visible == null || visible.isEmpty) return;
+    final stamped = '[$timestamp] $visible';
+    final key = developerMode ? null : _resolveKey(visible);
 
-    final isErr = isErrorLine(visible);
-    final stamped = '[${_timestamp()}] $visible';
+    if (key != null && key.startsWith('handshake_timeout:')) {
+      final index = _findLineByKey(key);
+      if (index != -1) {
+        final existing = _lines[index];
+        final count = _extractCount(existing) + 1;
+        // Retain the first worker and its peer/transport metadata as the sample.
+        _lines[index] = '[$timestamp] ${_extractBody(existing)} (x$count)';
+        _trimAndNotify();
+        return;
+      }
+    }
 
-    if (isErr || _lines.isEmpty) {
+    if (isErrorLine(visible) || _lines.isEmpty) {
       _lines.add(stamped);
       _trimAndNotify();
       return;
     }
 
-    final key = developerMode ? null : _resolveKey(visible);
-
     if (key != null) {
       final index = _findLineByKey(key);
       if (index != -1) {
-        final existing = _lines[index];
-        final currentCount = _extractCount(existing) + 1;
-        if (key == 'worker_ready' || key.startsWith('turn_') || key == 'vk_auth') {
-          _lines[index] = '[${_timestamp()}] $visible (x$currentCount)';
+        final count = _extractCount(_lines[index]) + 1;
+        if (key == 'worker_ready' ||
+            key.startsWith('turn_') ||
+            key == 'vk_auth') {
+          _lines[index] = '[$timestamp] $visible (x$count)';
         } else {
           _lines[index] = stamped;
         }
@@ -148,16 +344,12 @@ class LogService extends ChangeNotifier {
       }
     }
 
-    final last = _lines.last;
-    final lastBody = _extractBody(last);
-    if (lastBody == visible) {
-      final currentCount = _extractCount(last) + 1;
-      _lines[_lines.length - 1] =
-          '[${_timestamp()}] $visible (x$currentCount)';
+    if (_extractBody(_lines.last) == visible) {
+      final count = _extractCount(_lines.last) + 1;
+      _lines[_lines.length - 1] = '[$timestamp] $visible (x$count)';
       _trimAndNotify();
       return;
     }
-
     _lines.add(stamped);
     _trimAndNotify();
   }
@@ -166,6 +358,7 @@ class LogService extends ChangeNotifier {
     if (_lines.length > maxLines) {
       _lines.removeRange(0, _lines.length - maxLines);
     }
+    if (_replaying) return;
     _version++;
     _scheduleNotify();
   }
@@ -227,6 +420,7 @@ class LogService extends ChangeNotifier {
     if (trimmed.startsWith('CAPTCHA_SOLVE|')) return null;
 
     if (trimmed.contains('FATAL_AUTH') ||
+        trimmed.contains('FATAL_LIMIT') ||
         trimmed.contains('[ФАТАЛ]') ||
         trimmed.contains('[ОШИБКА]') ||
         trimmed.contains('невосстановимая') ||
@@ -237,7 +431,8 @@ class LogService extends ChangeNotifier {
 
     if (trimmed.contains('Exclude-маршрут') ||
         trimmed.contains('Exclude-подсеть') ||
-        (trimmed.startsWith('[TUN]') && trimmed.contains('перехвата ещё нет'))) {
+        (trimmed.startsWith('[TUN]') &&
+            trimmed.contains('перехвата ещё нет'))) {
       return null;
     }
     if (trimmed.contains('Wintun-адаптер создан') ||
@@ -318,14 +513,16 @@ class LogService extends ChangeNotifier {
       return clean;
     }
 
-    if (trimmed.startsWith('[TURN]')) {
-      if (isErrorLine(trimmed)) {
-        return trimmed;
-      }
-      return null;
+    if (trimmed.startsWith('[TURN]') ||
+        trimmed.startsWith('[HANDSHAKE]') ||
+        trimmed.startsWith('[GETCONF]') ||
+        trimmed.startsWith('[TRANSPORT]')) {
+      return trimmed;
     }
 
     const keepPrefixes = [
+      // [FOCSQ] Правила, отказы определения EXE и ошибки direct видны в обычном журнале.
+      '[SPLIT]',
       '[КОННЕКТ]',
       '[ЯДРО]',
       '[ОКНО]',
@@ -334,6 +531,9 @@ class LogService extends ChangeNotifier {
       '[ТРЕЙ]',
       '[ВК]',
       '[АВТОСТАРТ]',
+      '[ЛОГ]',
+      '[ЖУРНАЛ]',
+      '[ДИАГНОСТИКА]',
     ];
     for (final prefix in keepPrefixes) {
       if (trimmed.startsWith(prefix)) return trimmed;
@@ -343,7 +543,8 @@ class LogService extends ChangeNotifier {
       if (isErrorLine(trimmed)) {
         return trimmed;
       }
-      return '[ВОРКЕР] Поток готов ✓';
+      if (trimmed.contains('Поток готов')) return '[ВОРКЕР] Поток готов ✓';
+      return trimmed;
     }
 
     return null;
@@ -358,7 +559,8 @@ class LogService extends ChangeNotifier {
   void clear() {
     _notifyTimer?.cancel();
     _notifyTimer = null;
-    if (_lines.isEmpty) return;
+    if (_lines.isEmpty && _rawRecords.isEmpty) return;
+    _rawRecords.clear();
     _lines.clear();
     _version++;
     notifyListeners();

@@ -146,6 +146,69 @@ impl CoreSnapshot {
     }
 }
 
+/// Cumulative ingress diagnostics before TURN demultiplexing. On UDP each
+/// observation is a datagram; on TCP/TLS it is one decoded TURN frame.
+/// STUN maintenance traffic is counted separately from peer ChannelData.
+/// wire_bytes counts available frame buffers. TCP frames discarded by the
+/// stream decoder on pool exhaustion have no retained length and add only
+/// to wire_packets/channel_data_packets/pool_deficit_drops.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TurnIngressSnapshot {
+    pub wire_packets: u64,
+    pub wire_bytes: u64,
+    pub stun_packets: u64,
+    pub channel_data_packets: u64,
+    pub wrong_channel_packets: u64,
+    pub other_packets: u64,
+    pub queue_full_drops: u64,
+    pub pool_deficit_drops: u64,
+}
+
+#[derive(Default)]
+struct TurnIngressCounters {
+    wire_packets: AtomicU64,
+    wire_bytes: AtomicU64,
+    stun_packets: AtomicU64,
+    channel_data_packets: AtomicU64,
+    wrong_channel_packets: AtomicU64,
+    other_packets: AtomicU64,
+}
+
+impl TurnIngressCounters {
+    fn observe_dropped_stream_data(&self) {
+        self.wire_packets.fetch_add(1, Ordering::Relaxed);
+        self.channel_data_packets.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn observe(&self, wire: &[u8], active_channel: u16) {
+        self.wire_packets.fetch_add(1, Ordering::Relaxed);
+        self.wire_bytes
+            .fetch_add(wire.len() as u64, Ordering::Relaxed);
+        if let Some((channel, _)) = channel_data_header(wire) {
+            self.channel_data_packets.fetch_add(1, Ordering::Relaxed);
+            if channel != active_channel {
+                self.wrong_channel_packets.fetch_add(1, Ordering::Relaxed);
+            }
+        } else if is_stun(wire) {
+            self.stun_packets.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.other_packets.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn snapshot(&self) -> TurnIngressSnapshot {
+        TurnIngressSnapshot {
+            wire_packets: self.wire_packets.load(Ordering::Relaxed),
+            wire_bytes: self.wire_bytes.load(Ordering::Relaxed),
+            stun_packets: self.stun_packets.load(Ordering::Relaxed),
+            channel_data_packets: self.channel_data_packets.load(Ordering::Relaxed),
+            wrong_channel_packets: self.wrong_channel_packets.load(Ordering::Relaxed),
+            other_packets: self.other_packets.load(Ordering::Relaxed),
+            ..TurnIngressSnapshot::default()
+        }
+    }
+}
+
 struct DriverShared {
     snapshot: watch::Sender<CoreSnapshot>,
     wake: Notify,
@@ -153,6 +216,7 @@ struct DriverShared {
     terminal_present: AtomicBool,
     control_sent: AtomicBool,
     channel: AtomicU16,
+    ingress: TurnIngressCounters,
     queue_full_drops: AtomicU64,
     pool_deficit_drops: AtomicU64,
     #[cfg(test)]
@@ -160,6 +224,13 @@ struct DriverShared {
 }
 
 impl DriverShared {
+    fn ingress_snapshot(&self) -> TurnIngressSnapshot {
+        let mut snapshot = self.ingress.snapshot();
+        snapshot.queue_full_drops = self.queue_full_drops.load(Ordering::Relaxed);
+        snapshot.pool_deficit_drops = self.pool_deficit_drops.load(Ordering::Relaxed);
+        snapshot
+    }
+
     fn fail(&self, reason: impl Into<Arc<str>>) {
         if self.closing.load(Ordering::Acquire) {
             return;
@@ -228,6 +299,10 @@ pub struct TurnReceiver {
 }
 
 impl TurnReceiver {
+    pub(crate) fn ingress_snapshot(&self) -> TurnIngressSnapshot {
+        self.shared.ingress_snapshot()
+    }
+
     pub async fn recv(&mut self) -> Result<PacketBuf> {
         loop {
             if let Some(reason) = self.shared.terminal() {
@@ -256,6 +331,10 @@ impl TurnReceiver {
 }
 
 impl TurnAllocation {
+    pub(crate) fn ingress_snapshot(&self) -> TurnIngressSnapshot {
+        self.shared.ingress_snapshot()
+    }
+
     pub async fn connect(
         target: TurnConnectTarget<'_>,
         username: Arc<str>,
@@ -303,6 +382,7 @@ impl TurnAllocation {
             terminal_present: AtomicBool::new(false),
             control_sent: AtomicBool::new(false),
             channel: AtomicU16::new(0),
+            ingress: TurnIngressCounters::default(),
             queue_full_drops: AtomicU64::new(0),
             pool_deficit_drops: AtomicU64::new(0),
             #[cfg(test)]
@@ -1088,6 +1168,7 @@ async fn driver_loop_stream(
                 }
             }
             StreamDriverEvent::Frame(Ok(TurnStreamFrame::DataDropped)) => {
+                shared.ingress.observe_dropped_stream_data();
                 shared.pool_deficit_drops.fetch_add(1, Ordering::Relaxed);
             }
             StreamDriverEvent::Frame(Err(error)) => {
@@ -1352,6 +1433,9 @@ fn process_packet_measured(
     mut packet: PacketBuf,
 ) -> PacketAction {
     let wire = packet.as_slice();
+    shared
+        .ingress
+        .observe(wire, shared.channel.load(Ordering::Acquire));
     if let Some((channel, payload_length)) = channel_data_header(wire) {
         if channel != shared.channel.load(Ordering::Acquire) {
             return PacketAction::Wait;
@@ -1390,6 +1474,9 @@ fn process_deficit_packet_measured(
     shared: &DriverShared,
     wire: &[u8],
 ) -> PacketAction {
+    shared
+        .ingress
+        .observe(wire, shared.channel.load(Ordering::Acquire));
     if let Some((channel, _)) = channel_data_header(wire) {
         if channel == shared.channel.load(Ordering::Acquire) {
             shared.pool_deficit_drops.fetch_add(1, Ordering::Relaxed);
@@ -1489,6 +1576,118 @@ fn stun_suffix(stun_code: i32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn diagnostic_shared(channel: u16) -> DriverShared {
+        let (snapshot, _) = watch::channel(CoreSnapshot::default());
+        DriverShared {
+            snapshot,
+            wake: Notify::new(),
+            closing: AtomicBool::new(false),
+            terminal_present: AtomicBool::new(false),
+            control_sent: AtomicBool::new(false),
+            channel: AtomicU16::new(channel),
+            ingress: TurnIngressCounters::default(),
+            queue_full_drops: AtomicU64::new(0),
+            pool_deficit_drops: AtomicU64::new(0),
+            native_pumps: AtomicU64::new(0),
+        }
+    }
+
+    fn diagnostic_core() -> Arc<NativeCore> {
+        NativeCore::create(
+            "127.0.0.1:3478".parse().unwrap(),
+            "synthetic-user",
+            "synthetic-password",
+            "127.0.0.1:46000".parse().unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ingress_diagnostics_distinguish_stun_wrong_channel_and_malformed_wire() {
+        let core = diagnostic_core();
+        let shared = diagnostic_shared(0x4021);
+        let pool = PacketPool::new(1);
+        let (incoming, mut received) = mpsc::channel(4);
+        let mut stun = [0u8; 20];
+        stun[4..8].copy_from_slice(&MAGIC_COOKIE);
+        let matching = [0x40, 0x21, 0, 2, 0x80, 0];
+        let wrong_channel = [0x40, 0x22, 0, 1, 5];
+        let malformed = [0x40, 0x21, 0, 9, 1];
+        for wire in [stun.as_slice(), &matching, &wrong_channel, &malformed] {
+            let mut packet = pool.acquire();
+            packet.read_area()[..wire.len()].copy_from_slice(wire);
+            packet.set_read_len(wire.len()).unwrap();
+            assert!(!matches!(
+                process_packet(&core, &shared, &incoming, packet),
+                PacketAction::OwnerClosed
+            ));
+            if wire == matching {
+                // Diagnostics must not change the peer payload delivered by demux.
+                assert_eq!(received.try_recv().unwrap().as_slice(), &[0x80, 0]);
+            }
+        }
+        assert!(received.try_recv().is_err());
+        assert_eq!(
+            shared.ingress_snapshot(),
+            TurnIngressSnapshot {
+                wire_packets: 4,
+                wire_bytes: 36,
+                stun_packets: 1,
+                channel_data_packets: 2,
+                wrong_channel_packets: 1,
+                other_packets: 1,
+                queue_full_drops: 0,
+                pool_deficit_drops: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn deficit_receive_is_counted_before_peer_data_is_dropped() {
+        let core = diagnostic_core();
+        let shared = diagnostic_shared(0x4021);
+        let matching = [0x40, 0x21, 0, 2, 0x80, 0];
+        let wrong_channel = [0x40, 0x22, 0, 1, 5];
+        assert!(matches!(
+            process_deficit_packet(&core, &shared, &matching),
+            PacketAction::Wait
+        ));
+        assert!(matches!(
+            process_deficit_packet(&core, &shared, &wrong_channel),
+            PacketAction::Wait
+        ));
+        let snapshot = shared.ingress_snapshot();
+        assert_eq!(snapshot.wire_packets, 2);
+        assert_eq!(snapshot.channel_data_packets, 2);
+        assert_eq!(snapshot.wrong_channel_packets, 1);
+        assert_eq!(snapshot.pool_deficit_drops, 1);
+        assert_eq!(snapshot.queue_full_drops, 0);
+    }
+
+    #[test]
+    fn queue_full_peer_drop_is_not_reported_as_no_wire_traffic() {
+        let core = diagnostic_core();
+        let shared = diagnostic_shared(0x4021);
+        let pool = PacketPool::new(2);
+        let (incoming, mut received) = mpsc::channel(1);
+        let matching = [0x40, 0x21, 0, 2, 0x80, 0];
+        for _ in 0..2 {
+            let mut packet = pool.acquire();
+            packet.read_area()[..matching.len()].copy_from_slice(&matching);
+            packet.set_read_len(matching.len()).unwrap();
+            assert!(matches!(
+                process_packet(&core, &shared, &incoming, packet),
+                PacketAction::Wait
+            ));
+        }
+        let snapshot = shared.ingress_snapshot();
+        assert_eq!(snapshot.wire_packets, 2);
+        assert_eq!(snapshot.channel_data_packets, 2);
+        assert_eq!(snapshot.queue_full_drops, 1);
+        assert_eq!(received.try_recv().unwrap().as_slice(), &[0x80, 0]);
+        assert!(received.try_recv().is_err());
+    }
 
     #[test]
     fn turn_socket_buffer_budget_is_bounded_per_worker() {

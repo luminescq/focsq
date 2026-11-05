@@ -1,20 +1,26 @@
-﻿// SPDX-FileCopyrightText: 2026 luminescq
+// SPDX-FileCopyrightText: 2026 luminescq
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
+
 import '../modals/profile_form_components.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_icons.dart';
 import '../models/app_settings.dart';
 import '../service/autostart.dart';
 import '../service/db.dart';
+// [FOCSQ] Список EXE загружается через уже используемый приложением Rust-мост.
+import '../service/connect.dart';
 import '../service/logs.dart';
 import '../service/tray_service.dart';
 import '../service/update.dart';
 import '../service/vk/token.dart';
 import '../widgets/custom_alert.dart';
 import '../widgets/app_scrollbar.dart';
+// [FOCSQ] Редактор приложений/доменов/IP хранит правила отдельно от общих настроек Isar.
+import '../widgets/split_tunnel_card.dart';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
@@ -26,6 +32,8 @@ class SettingsScreen extends StatefulWidget {
 class _SettingsScreenState extends State<SettingsScreen> {
   bool _startAtLaunch = false;
   bool _hasToken = false;
+  bool _savingAuthDirectory = false;
+  final TextEditingController _authDirectoryCtrl = TextEditingController();
   AppSettings? _settings;
   final TextEditingController _manualHashesCtrl = TextEditingController();
 
@@ -42,6 +50,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   @override
   void dispose() {
+    _authDirectoryCtrl.dispose();
     _manualHashesCtrl.dispose();
     super.dispose();
   }
@@ -50,13 +59,52 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final isEnabled = await AutostartService.isEnabled();
     final settings = await DbService.getSettings();
     final hasToken = await VkToken.has();
+    String authDirectory = '';
+    if (Platform.isWindows) {
+      try {
+        authDirectory = await VkToken.getAuthDataDirectory();
+      } catch (error) {
+        LogService().add(
+          '[ВК] Не удалось прочитать путь профиля WebView2: $error',
+        );
+      }
+    }
     if (mounted) {
       setState(() {
         _startAtLaunch = isEnabled;
         _settings = settings;
         _hasToken = hasToken;
+        _authDirectoryCtrl.text = authDirectory;
         _manualHashesCtrl.text = settings.customHashes;
       });
+    }
+  }
+
+  Future<void> _saveAuthDirectory({bool reset = false}) async {
+    if (_savingAuthDirectory) return;
+    final path = reset ? '' : _authDirectoryCtrl.text.trim();
+    setState(() => _savingAuthDirectory = true);
+    try {
+      await VkToken.setAuthDataDirectory(path);
+      if (!mounted) return;
+      _authDirectoryCtrl.text = path;
+      CustomAlert.show(
+        context,
+        title: 'Папка данных входа ВК',
+        message:
+            'Сохранено. Путь применяется при следующем открытии окна входа ВК.',
+        type: AlertType.success,
+      );
+    } catch (error) {
+      if (!mounted) return;
+      CustomAlert.show(
+        context,
+        title: 'Не удалось сохранить папку',
+        message: error.toString(),
+        type: AlertType.warning,
+      );
+    } finally {
+      if (mounted) setState(() => _savingAuthDirectory = false);
     }
   }
 
@@ -183,6 +231,66 @@ class _SettingsScreenState extends State<SettingsScreen> {
                               });
                             },
                           ),
+                        ),
+                        const SizedBox(height: 8),
+
+                        if (Platform.isWindows) ...[
+                          const Text(
+                            'Папка данных входа ВК (WebView2)',
+                            style: TextStyle(
+                              color: AppColors.textPrimary,
+                              fontSize: 13,
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          TextField(
+                            controller: _authDirectoryCtrl,
+                            enabled: !_savingAuthDirectory,
+                            style: const TextStyle(
+                              color: AppColors.textPrimary,
+                              fontSize: 13,
+                            ),
+                            decoration: const InputDecoration(
+                              hintText: r'D:\FOCSQ\vk_auth_data',
+                              hintStyle: TextStyle(
+                                color: AppColors.textSecondary,
+                              ),
+                              border: OutlineInputBorder(),
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          const Text(
+                            'Полный путь к папке профиля, включая vk_auth_data. '
+                            'Пустое поле — прежний путь по умолчанию. '
+                            'Существующие данные не переносятся. '
+                            'Хранилище токена ВК не меняется.',
+                            style: TextStyle(
+                              color: AppColors.textSecondary,
+                              fontSize: 12,
+                            ),
+                          ),
+                          Row(
+                            children: [
+                              TextButton(
+                                onPressed: _savingAuthDirectory
+                                    ? null
+                                    : () => _saveAuthDirectory(),
+                                child: const Text('Сохранить путь'),
+                              ),
+                              TextButton(
+                                onPressed: _savingAuthDirectory
+                                    ? null
+                                    : () => _saveAuthDirectory(reset: true),
+                                child: const Text('По умолчанию'),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 8),
+                        ],
+
+                        // [FOCSQ] Изменения split tunnelling применяются при следующем подключении.
+                        SplitTunnelCard(
+                          loadApplications: ConnectService().listSplitApplications,
                         ),
                         const SizedBox(height: 8),
 
@@ -447,8 +555,31 @@ class _LoginButton extends StatefulWidget {
 
 class _LoginButtonState extends State<_LoginButton> {
   bool _hovering = false;
+  bool _busy = false;
 
   Future<void> _handleTap() async {
+    if (_busy) return;
+    setState(() => _busy = true);
+    try {
+      await _performTap();
+    } catch (error) {
+      // Do not include OAuth URLs or token-bearing exceptions in the log.
+      LogService().add('[ВК] Ошибка открытия входа: ${error.runtimeType}');
+      if (mounted) {
+        CustomAlert.show(
+          context,
+          title: 'Вход не завершён',
+          message:
+              'Не удалось открыть вход ВК. Подробности — в журнале приложения.',
+          type: AlertType.warning,
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _performTap() async {
     if (widget.hasToken) {
       final confirmed = await showDialog<bool>(
         context: context,
@@ -483,17 +614,18 @@ class _LoginButtonState extends State<_LoginButton> {
           ],
         ),
       );
-      if (confirmed != true) return;
+      if (confirmed != true || !mounted) return;
 
       final ok = await VkToken.delete();
       if (!ok) {
         LogService().add('[ВК] Не удалось удалить токен');
       }
-      if (ok) widget.onTokenChanged(false);
+      if (ok && mounted) widget.onTokenChanged(false);
       return;
     }
 
     final error = await VkToken.login();
+    if (!mounted) return;
     if (error != null) {
       LogService().add('[ВК] Вход не завершён: $error');
       if (mounted) {
@@ -530,11 +662,11 @@ class _LoginButtonState extends State<_LoginButton> {
   @override
   Widget build(BuildContext context) {
     return MouseRegion(
-      cursor: SystemMouseCursors.click,
+      cursor: _busy ? SystemMouseCursors.basic : SystemMouseCursors.click,
       onEnter: (_) => setState(() => _hovering = true),
       onExit: (_) => setState(() => _hovering = false),
       child: GestureDetector(
-        onTap: _handleTap,
+        onTap: _busy ? null : _handleTap,
         child: AnimatedContainer(
           duration: const Duration(milliseconds: 150),
           padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
@@ -550,7 +682,7 @@ class _LoginButtonState extends State<_LoginButton> {
             ),
           ),
           child: Text(
-            widget.hasToken ? 'Сброс ВК' : 'Логин',
+            _busy ? 'Вход…' : (widget.hasToken ? 'Сброс ВК' : 'Логин'),
             style: TextStyle(
               color: widget.hasToken ? Colors.redAccent : AppColors.textPrimary,
               fontSize: 13,

@@ -1,15 +1,18 @@
-﻿// SPDX-FileCopyrightText: 2026 luminescq
+// SPDX-FileCopyrightText: 2026 luminescq
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 import 'dart:async';
+import 'dart:io';
 
 import 'package:desktop_webview_window/desktop_webview_window.dart';
 import 'package:flutter/material.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:window_manager/window_manager.dart';
 
 import 'service/app_visibility.dart';
 import 'service/autostart.dart';
 import 'service/connect.dart';
 import 'service/db.dart';
+import 'service/diagnostic_file.dart';
 import 'service/logs.dart';
 import 'service/tray_service.dart';
 import 'theme/app_colors.dart';
@@ -19,6 +22,8 @@ Future<void> main(List<String> args) async {
   if (runWebViewTitleBarWidget(args)) return;
 
   WidgetsFlutterBinding.ensureInitialized();
+
+  await _initDiagnosticLog();
 
   await DbService.init();
   final settings = await DbService.getSettings();
@@ -33,6 +38,34 @@ Future<void> main(List<String> args) async {
   unawaited(TrayService.instance.setEnabled(settings.tray));
 
   unawaited(ConnectService().prewarm());
+}
+
+Future<void> _initDiagnosticLog() async {
+  final logs = LogService();
+  try {
+    final support = await getApplicationSupportDirectory();
+    final output = await DiagnosticFileLog.open(
+      directory: Directory('${support.path}${Platform.pathSeparator}logs'),
+      onError: (_) => logs.add(
+        '[ЖУРНАЛ] Ошибка записи подробного лога на диск; проверьте свободное место и доступ к папке logs',
+      ),
+    );
+    logs.configureDiagnosticOutput(
+      filePath: output.filePath,
+      writer: output.add,
+      close: output.close,
+    );
+    logs.add(
+      '[ДИАГНОСТИКА] Начало журнала: diagnostics-v1 | '
+      '${Platform.operatingSystem} | pid=$pid | CSQTT-WIRE-3 / CSQTT 2.5.0',
+    );
+    logs.add('[ЖУРНАЛ] Подробный лог: ${output.filePath}');
+  } catch (error) {
+    logs.add(
+      '[ЖУРНАЛ] Ошибка открытия подробного лога (${error.runtimeType}); '
+      'проверьте доступ к каталогу данных приложения',
+    );
+  }
 }
 
 Future<void> _initWindow(bool minimized) async {

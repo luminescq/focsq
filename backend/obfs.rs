@@ -7,7 +7,6 @@ use crate::{
 };
 use aes::cipher::{InnerIvInit, KeyInit, StreamCipher};
 use anyhow::{Result, bail};
-use aws_lc_rs::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey};
 use hmac::{Hmac, Mac};
 use rand::RngExt;
 use rand::{Rng, SeedableRng, rngs::StdRng};
@@ -96,7 +95,6 @@ impl ObfsState {
 pub struct ObfsCipher {
     aes: aes::Aes128,
     hmac: Hmac<Sha1>,
-    chacha: LessSafeKey,
 }
 
 impl ObfsCipher {
@@ -106,10 +104,6 @@ impl ObfsCipher {
                 .map_err(|_| anyhow::anyhow!("AES key rejected"))?,
             hmac: <Hmac<Sha1> as hmac::digest::KeyInit>::new_from_slice(&key[16..])
                 .map_err(|_| anyhow::anyhow!("HMAC key rejected"))?,
-            chacha: LessSafeKey::new(
-                UnboundKey::new(&CHACHA20_POLY1305, &key)
-                    .map_err(|_| anyhow::anyhow!("AWS-LC ChaCha20-Poly1305 key rejected"))?,
-            ),
         })
     }
 
@@ -137,11 +131,9 @@ impl ObfsCipher {
             state.rng.random_range(0..padding_max)
         };
         let padding_total = padding_random + 1;
-        let tail = if config.mode == ObfsMode::Video {
-            padding_total + 10
-        } else {
-            padding_total + 16
-        };
+        // CSQTT 2.5 uses AES-CTR + HMAC-SHA1-80 for both media profiles.
+        // The RTP padding is encrypted together with the IP/control payload.
+        let tail = padding_total + 10;
         let range = packet.range();
         if range.start < 24
             || range
@@ -176,50 +168,26 @@ impl ObfsCipher {
         let range = packet.range();
         let payload_start = range.start + 24;
         let payload_end = payload_start + payload_len;
-        let nonce = nonce(config.ssrc, sequence, timestamp);
-        if config.mode == ObfsMode::Video {
-            packet.extend_tail(padding_total + 10)?;
-            let storage = packet.storage_mut();
-            let iv = srtp_iv(config.ssrc, sequence, timestamp);
-            let mut cipher = aes_ctr(&self.aes, &iv);
-            cipher.apply_keystream(&mut storage[payload_start..payload_end]);
-            if padding_random > 0 {
-                state
-                    .rng
-                    .fill_bytes(&mut storage[payload_end..payload_end + padding_random]);
-            }
-            storage[payload_end + padding_total - 1] = padding_total as u8;
-            let tag_start = payload_end + padding_total;
-            let mut mac = self.hmac.clone();
-            mac.update(&storage[range.start..tag_start]);
-            let tag = mac.finalize().into_bytes();
-            storage[tag_start..tag_start + 10].copy_from_slice(&tag[..10]);
-        } else {
-            packet.extend_tail(16 + padding_total)?;
-            let storage = packet.storage_mut();
-            let (prefix, payload_and_tail) = storage.split_at_mut(payload_start);
-            let tag = self
-                .chacha
-                .seal_in_place_separate_tag(
-                    Nonce::assume_unique_for_key(nonce),
-                    Aad::from(&prefix[range.start..payload_start]),
-                    &mut payload_and_tail[..payload_len],
-                )
-                .map_err(|_| anyhow::anyhow!("obfs: chacha encrypt"))?;
-            let storage = packet.storage_mut();
-            storage[payload_end..payload_end + 16].copy_from_slice(tag.as_ref());
-            let padding_start = payload_end + 16;
-            if padding_random > 0 {
-                state
-                    .rng
-                    .fill_bytes(&mut storage[padding_start..padding_start + padding_random]);
-            }
-            storage[padding_start + padding_total - 1] = padding_total as u8;
+        packet.extend_tail(padding_total + 10)?;
+        let storage = packet.storage_mut();
+        if padding_random > 0 {
+            state
+                .rng
+                .fill_bytes(&mut storage[payload_end..payload_end + padding_random]);
         }
+        let tag_start = payload_end + padding_total;
+        storage[tag_start - 1] = padding_total as u8;
+        let iv = srtp_iv(config.ssrc, sequence, timestamp);
+        let mut cipher = aes_ctr(&self.aes, &iv);
+        cipher.apply_keystream(&mut storage[payload_start..tag_start]);
+        let mut mac = self.hmac.clone();
+        mac.update(&storage[range.start..tag_start]);
+        let tag = mac.finalize().into_bytes();
+        storage[tag_start..tag_start + 10].copy_from_slice(&tag[..10]);
         Ok(())
     }
 
-    pub fn unwrap(&self, packet: &mut PacketBuf, mode: ObfsMode) -> Result<u16> {
+    pub fn unwrap(&self, packet: &mut PacketBuf, _mode: ObfsMode) -> Result<u16> {
         let range = packet.range();
         let wire = packet.as_slice();
         if wire.len() < 13 || wire[0] >> 6 != 2 {
@@ -232,73 +200,43 @@ impl ObfsCipher {
         let sequence = u16::from_be_bytes([wire[2], wire[3]]);
         let timestamp = u32::from_be_bytes(wire[4..8].try_into()?);
         let ssrc = u32::from_be_bytes(wire[8..12].try_into()?);
-        let mut header_len = 12usize;
+        let mut header_len = 12usize + usize::from(wire[0] & 0x0f) * 4;
+        if wire.len() < header_len {
+            bail!("obfs: packet too short for RTP CSRCs");
+        }
         if wire[0] & 0x10 != 0 {
-            if wire.len() < 16 {
+            if wire.len() < header_len + 4 {
                 bail!("obfs: packet too short for extension header");
             }
-            header_len += 4 + u16::from_be_bytes([wire[14], wire[15]]) as usize * 4;
+            let extension_words = u16::from_be_bytes([wire[header_len + 2], wire[header_len + 3]]);
+            header_len += 4 + usize::from(extension_words) * 4;
         }
-        if wire.len() < header_len {
-            bail!("obfs: packet too short for calculated RTP header");
+        if wire.len() < header_len + 10 {
+            bail!("obfs srtp: missing payload or authentication tag");
         }
+        let tag_start = range.end - 10;
+        let payload_start = range.start + header_len;
         let storage = packet.storage_mut();
-        if mode == ObfsMode::Video {
-            if range.len() < header_len + 10 {
-                bail!("obfs srtp: missing authentication tag");
-            }
-            let tag_start = range.end - 10;
-            let mut mac = self.hmac.clone();
-            mac.update(&storage[range.start..tag_start]);
-            if mac
-                .verify_truncated_left(&storage[tag_start..range.end])
-                .is_err()
-            {
-                bail!("obfs srtp: authentication failed");
-            }
-            let mut payload_end = tag_start;
-            if storage[range.start] & 0x20 != 0 {
-                let padding = storage[payload_end - 1] as usize;
-                if padding == 0 || padding > payload_end - range.start - header_len {
-                    bail!("obfs srtp: invalid padding length {padding}");
-                }
-                payload_end -= padding;
-            }
-            let payload_start = range.start + header_len;
-            let iv = srtp_iv(ssrc, sequence, timestamp);
-            let mut cipher = aes_ctr(&self.aes, &iv);
-            cipher.apply_keystream(&mut storage[payload_start..payload_end]);
-            packet.set_range(payload_start..payload_end)?;
-            return Ok(sequence);
+        let mut mac = self.hmac.clone();
+        mac.update(&storage[range.start..tag_start]);
+        if mac
+            .verify_truncated_left(&storage[tag_start..range.end])
+            .is_err()
+        {
+            bail!("obfs srtp: authentication failed");
         }
-        if payload_type != 111 {
-            bail!("obfs audio: expected payload type 111");
-        }
-        let mut payload_end = range.end;
+        let iv = srtp_iv(ssrc, sequence, timestamp);
+        let mut cipher = aes_ctr(&self.aes, &iv);
+        cipher.apply_keystream(&mut storage[payload_start..tag_start]);
+        let mut payload_end = tag_start;
         if storage[range.start] & 0x20 != 0 {
-            let padding = storage[payload_end - 1] as usize;
-            if padding == 0 || padding > payload_end - range.start - header_len {
-                bail!("obfs: invalid padding length {padding}");
+            let padding = storage[tag_start - 1] as usize;
+            if padding == 0 || padding > tag_start - payload_start {
+                bail!("obfs srtp: invalid padding length {padding}");
             }
             payload_end -= padding;
         }
-        let payload_start = range.start + header_len;
-        if payload_end <= payload_start + 16 {
-            bail!("obfs: empty encrypted payload or missing tag");
-        }
-        let tag_start = payload_end - 16;
-        let tag: [u8; 16] = storage[tag_start..payload_end].try_into()?;
-        let nonce = nonce(ssrc, sequence, timestamp);
-        let (prefix, payload_and_tail) = storage.split_at_mut(payload_start);
-        self.chacha
-            .open_in_place_separate_tag(
-                Nonce::assume_unique_for_key(nonce),
-                Aad::from(&prefix[range.start..payload_start]),
-                &tag,
-                &mut payload_and_tail[..tag_start - payload_start],
-            )
-            .map_err(|_| anyhow::anyhow!("obfs: auth (ChaCha20-Poly1305)"))?;
-        packet.set_range(payload_start..tag_start)?;
+        packet.set_range(payload_start..payload_end)?;
         Ok(sequence)
     }
 }
@@ -350,14 +288,6 @@ impl ObfsConfig {
     }
 }
 
-fn nonce(ssrc: u32, sequence: u16, timestamp: u32) -> [u8; 12] {
-    let mut value = [0u8; 12];
-    value[..4].copy_from_slice(&ssrc.to_be_bytes());
-    value[4..6].copy_from_slice(&sequence.to_be_bytes());
-    value[8..12].copy_from_slice(&timestamp.to_be_bytes());
-    value
-}
-
 fn srtp_iv(ssrc: u32, sequence: u16, timestamp: u32) -> [u8; 16] {
     let mut value = [0u8; 16];
     value[..4].copy_from_slice(&ssrc.to_be_bytes());
@@ -375,6 +305,14 @@ mod tests {
     use super::*;
     use crate::{packet::PacketPool, wrap::derive_wrap_key};
     use proptest::prelude::*;
+
+    // Authoritative synthetic GETCONF fixture from CSQTT 2.5's server tests.
+    // The video variant changes only RTP PT to 96 and recalculates its HMAC;
+    // the independently supplied AES ciphertext/IV are identical.
+    use crate::wire_protocol::CLIENT_GETCONF_AUDIO_FIXTURE as CSQTT25_AUDIO_FIXTURE;
+    const CSQTT25_VIDEO_FIXTURE: &str = "b06077881122334410203040bede0002325566775199aa005c468ea9f0329817714cb0d49b032855ae1b18c3ee81bf342bdd58cd166bdf23a16575b0ca29cb53618501b45b3ae4bb1fda630bb39ce45dbf5dde3073f99f87f2da0010b786f35f61d54f86e98b2d6e";
+    const CSQTT25_GETCONF: &[u8] =
+        b"GETCONF:46000|wire-device|wire-password|7|wire-salt|1|27|CSQTT-WIRE-2";
 
     fn roundtrip(mode: ObfsMode) {
         let pool = PacketPool::new(1);
@@ -459,10 +397,7 @@ mod tests {
             .unwrap()
             .wrap(&mut packet, &config, &mut state)
             .unwrap();
-        assert_eq!(
-            hex::encode(packet.as_slice()),
-            crate::wire_protocol::CLIENT_GETCONF_AUDIO_FIXTURE,
-        );
+        assert_eq!(hex::encode(packet.as_slice()), CSQTT25_AUDIO_FIXTURE,);
     }
 
     #[test]
@@ -509,25 +444,31 @@ mod tests {
     }
 
     #[test]
-    fn unwraps_go_audio_and_video_vectors() {
-        let cipher = ObfsCipher::new(derive_wrap_key("cross-language-password").unwrap()).unwrap();
-        for (encoded, mode) in [
-            (
-                "b06f9e5243e8f72f8b6fe47dbede00023211eb8551beef00ef3c0513fb6f0307716f44a2af1324af6b39f3b165e81c752be49913911ad0fd782649a54cc4f984cef050cce1b4d509cbae4d6e9359b57e0b9615",
-                ObfsMode::Audio,
-            ),
-            (
-                "b060cb1b7b25bb36709a0949bede00023211eb85512bb6004aac7f46ac97f3ef8522a3af2b8b4b536bc0b342d567aa5faa2ea4ecb07d22daf20c38ca989cda177175ab00",
-                ObfsMode::Video,
-            ),
-        ] {
+    fn unwraps_csqtt25_server_vectors_in_either_media_profile() {
+        let cipher = ObfsCipher::new(derive_wrap_key("wire-password").unwrap()).unwrap();
+        for encoded in [CSQTT25_AUDIO_FIXTURE, CSQTT25_VIDEO_FIXTURE] {
+            for mode in [ObfsMode::Audio, ObfsMode::Video] {
+                let wire = hex::decode(encoded).unwrap();
+                let pool = PacketPool::new(1);
+                let mut packet = pool.acquire();
+                packet.read_area()[..wire.len()].copy_from_slice(&wire);
+                packet.set_read_len(wire.len()).unwrap();
+                assert_eq!(cipher.unwrap(&mut packet, mode).unwrap(), 0x7788);
+                assert_eq!(packet.as_slice(), CSQTT25_GETCONF);
+            }
+        }
+    }
+
+    #[test]
+    fn csqtt25_server_fixture_rejects_wrong_password() {
+        let cipher = ObfsCipher::new(derive_wrap_key("different-password").unwrap()).unwrap();
+        for encoded in [CSQTT25_AUDIO_FIXTURE, CSQTT25_VIDEO_FIXTURE] {
             let wire = hex::decode(encoded).unwrap();
             let pool = PacketPool::new(1);
             let mut packet = pool.acquire();
             packet.read_area()[..wire.len()].copy_from_slice(&wire);
             packet.set_read_len(wire.len()).unwrap();
-            cipher.unwrap(&mut packet, mode).unwrap();
-            assert_eq!(packet.as_slice(), b"cross-language-payload");
+            assert!(cipher.unwrap(&mut packet, ObfsMode::Audio).is_err());
         }
     }
 
@@ -547,7 +488,7 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_audio_region_rejects_every_single_byte_tamper() {
+    fn audio_wire_rejects_every_single_byte_tamper() {
         let key = derive_wrap_key("tamper-password").unwrap();
         let cipher = ObfsCipher::new(key).unwrap();
         let config = ObfsConfig::new(ObfsMode::Audio);
@@ -562,8 +503,7 @@ mod tests {
                 .unwrap();
             packet.as_slice().to_vec()
         };
-        let authenticated_end = 24 + payload.len() + 16;
-        for index in 0..authenticated_end {
+        for index in 0..wire.len() {
             let mut tampered = wire.clone();
             tampered[index] ^= 1;
             let mut packet = pool.acquire();

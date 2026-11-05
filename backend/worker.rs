@@ -615,6 +615,11 @@ async fn worker_loop(
         if !context.paused.wait_until_resumed(&context.cancel).await {
             return;
         }
+        crate::log_error!(
+            "[HANDSHAKE][worker={id}] stage=credentials_wait peer={} transport={}",
+            context.params.peer,
+            context.params.turn_transport.as_str()
+        );
         let credential_lease = loop {
             if group_creds.is_unavailable() {
                 return;
@@ -658,6 +663,13 @@ async fn worker_loop(
             repair: context.repair.clone(),
             turn_endpoint_cursor,
         };
+        crate::log_error!(
+            "[HANDSHAKE][worker={id}] stage=session_start peer={} transport={} retry={} needs_config={}",
+            context.params.peer,
+            context.params.turn_transport.as_str(),
+            attempt,
+            get_config
+        );
         let (ready_tx, ready_rx) = oneshot::channel();
         let ready_credential_tx = context.ready_credential_tx.clone();
         let ready_credential = group_creds.credential_id;
@@ -713,6 +725,13 @@ async fn worker_loop(
             group_creds.release_allocation(&credential_lease).await;
         }
         let was_ready = ready_task.await.unwrap_or(false);
+        crate::log_error!(
+            "[HANDSHAKE][worker={id}] stage=session_end peer={} transport={} ready={} failed={}",
+            context.params.peer,
+            context.params.turn_transport.as_str(),
+            was_ready,
+            result.is_err()
+        );
         if was_ready {
             attempt = 0;
         }
@@ -843,6 +862,7 @@ async fn worker_loop(
                 }
                 if message.contains("FATAL_AUTH")
                     || message.contains("FATAL_PROTOCOL")
+                    || message.contains("FATAL_LIMIT")
                     || message.contains("FATAL_HANDSHAKE")
                     || message.contains("хеш мёртв")
                 {

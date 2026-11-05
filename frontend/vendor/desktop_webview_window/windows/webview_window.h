@@ -36,7 +36,7 @@ class WebviewWindow {
 
   virtual ~WebviewWindow();
 
-  using CreateCallback = std::function<void(bool success)>;
+  using CreateCallback = std::function<void(HRESULT result)>;
 
   void CreateAndShow(const std::wstring &title, int height, int width,
                      const std::wstring &userDataFolder,

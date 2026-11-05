@@ -6,15 +6,18 @@
 #include <windows.h>
 
 #include <map>
+#include <sstream>
 
 namespace {
 
 int64_t next_window_id_ = 0;
 
 bool IsWebViewRuntimeAvailable() {
-  LPWSTR version_info;
-  GetAvailableCoreWebView2BrowserVersionString(nullptr, &version_info);
-  return version_info != nullptr;
+  LPWSTR version_info = nullptr;
+  const HRESULT result = GetAvailableCoreWebView2BrowserVersionString(nullptr, &version_info);
+  const bool available = SUCCEEDED(result) && version_info != nullptr;
+  CoTaskMemFree(version_info);
+  return available;
 }
 
 }  // namespace
@@ -76,20 +79,24 @@ void WebviewWindowPlugin::HandleMethodCall(
         [this, window_id]() { windows_.erase(window_id); });
     std::shared_ptr<flutter::MethodResult<flutter::EncodableValue>> result2(
         std::move(result));
+    auto creation_failed = std::make_shared<bool>(false);
     window->CreateAndShow(
         utf8_to_wide(title), int(height), int(width),
         utf8_to_wide(userDataFolder), int(windowPosX), int(windowPosY),
         useWindowPositionAndSize, openMaximized,
-        [this, window_id, result(result2)](bool succeed) mutable {
-          if (!succeed) {
-            result->Error("0", "failed to show window");
+        [this, window_id, result(result2), creation_failed](HRESULT hr) {
+          if (FAILED(hr)) {
+            *creation_failed = true;
+            std::ostringstream code;
+            code << "webview_init_0x" << std::hex << static_cast<unsigned long>(hr);
+            result->Error(code.str(), "WebView2 initialization failed");
             windows_.erase(window_id);
             return;
           }
           result->Success(flutter::EncodableValue(window_id));
         });
     next_window_id_++;
-    windows_[window_id] = std::move(window);
+    if (!*creation_failed) windows_[window_id] = std::move(window);
   } else if (method_call.method_name() == "launch") {
     auto *arguments =
         std::get_if<flutter::EncodableMap>(method_call.arguments());
@@ -111,7 +118,13 @@ void WebviewWindowPlugin::HandleMethodCall(
     }
     windows_[window_id]->GetWebView()->setTriggerOnUrlRequestedEvent(
         triggerOnUrlRequestEvent);
-    windows_[window_id]->GetWebView()->Navigate(utf8_to_wide(url));
+    const HRESULT hr = windows_[window_id]->GetWebView()->Navigate(utf8_to_wide(url));
+    if (FAILED(hr)) {
+      std::ostringstream code;
+      code << "webview_navigate_0x" << std::hex << static_cast<unsigned long>(hr);
+      result->Error(code.str(), "WebView2 navigation failed");
+      return;
+    }
     result->Success();
   } else if (method_call.method_name() ==
              "addScriptToExecuteOnDocumentCreated") {

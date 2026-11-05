@@ -15,9 +15,12 @@ import 'captcha.dart';
 import 'db.dart';
 import 'import.dart';
 import 'logs.dart';
+// [FOCSQ] Редактор и запуск читают один атомарно сохранённый файл правил.
+import 'split_tunnel.dart';
 import 'tun_rights.dart';
 import 'vk/auto_calls.dart';
 import 'vk/token.dart';
+import 'worker_limits.dart';
 
 enum ConnectState { disconnected, connecting, connected, disconnecting }
 
@@ -36,7 +39,22 @@ class ConnectStats {
 }
 
 class ConnectService extends ChangeNotifier {
-  ConnectService._();
+  ConnectService._() : _stopCore = rust.stopCsqttClient;
+
+  @visibleForTesting
+  ConnectService.forTesting({
+    required Future<void> coreRun,
+    required Future<void> Function() stopCore,
+    // Keep the public test callback name separate from private storage.
+    // ignore: prefer_initializing_formals
+  }) : _stopCore = stopCore {
+    _clientRunning = true;
+    _state = ConnectState.connecting;
+    _restartConnectWatchdog();
+    _attachCoreRun(coreRun);
+  }
+
+  final Future<void> Function() _stopCore;
 
   static final ConnectService _instance = ConnectService._();
 
@@ -105,9 +123,10 @@ class ConnectService extends ChangeNotifier {
 
     await stop();
     await waitForExit();
-    if (_state != ConnectState.disconnected) {
-      _log('[КОННЕКТ] Ядро не ответило на отмену — состояние сброшено');
-      _coreRun = null;
+    if (_coreRun != null) {
+      _log('[КОННЕКТ] Отмена отправлена — ожидаю завершения ядра');
+      _setState(ConnectState.disconnecting);
+    } else if (_state != ConnectState.disconnected) {
       _clientRunning = false;
       _setState(ConnectState.disconnected);
     }
@@ -134,6 +153,12 @@ class ConnectService extends ChangeNotifier {
         await _ensureWintunDll();
       } catch (_) {}
     }
+  }
+
+  // [FOCSQ] Общая инициализация моста предотвращает гонку выбора EXE и подключения.
+  Future<List<String>> listSplitApplications() async {
+    await _ensureRust();
+    return rust.listRunningApps();
   }
 
   Future<void> _ensureRust() {
@@ -164,7 +189,7 @@ class ConnectService extends ChangeNotifier {
   }
 
   Future<String?> toggle() async {
-    final error = await (_state == ConnectState.disconnected
+    final error = await (_state == ConnectState.disconnected && _coreRun == null
         ? start()
         : stop());
     if (error != null) _log('[КОННЕКТ] $error');
@@ -173,6 +198,9 @@ class ConnectService extends ChangeNotifier {
 
   Future<String?> start() async {
     if (_state != ConnectState.disconnected) return null;
+    if (_coreRun != null) {
+      return 'Предыдущее ядро ещё завершает работу — дождитесь отключения';
+    }
 
     LogService().clear();
 
@@ -212,6 +240,15 @@ class ConnectService extends ChangeNotifier {
     }
     if (password.isEmpty) {
       return 'В профиле «${profile.name}» не указан пароль';
+    }
+    // Reject legacy profiles before creating VK calls or starting the core.
+    final workerIssue = workerCountIssue(profile.power);
+    if (workerIssue != null) return workerIssue;
+    // [FOCSQ] Повреждённые правила не подменяем полным туннелем и проверяем до VK-звонков.
+    final splitSettings = await SplitTunnelStore.load();
+    final splitConfig = splitSettings.toJsonString();
+    if (splitSettings.enabled && !Platform.isWindows) {
+      return 'Split tunnelling пока доступен только на Windows';
     }
 
     if (Platform.isWindows) {
@@ -314,6 +351,8 @@ class ConnectService extends ChangeNotifier {
       tunUds: _tunMode,
       validateVkHashes: false,
       vkJsToken: vkToken ?? '',
+      // [FOCSQ] Копия правил закрепляется за новой сессией до переподключения.
+      splitTunnel: splitConfig,
     );
 
     if (Platform.isWindows) {
@@ -322,18 +361,21 @@ class ConnectService extends ChangeNotifier {
 
     _clientRunning = true;
 
-    _coreRun = rust
-        .startCsqttClient(config: config)
-        .then((_) => _onCoreExited(null))
-        .catchError(_onCoreExited);
+    _attachCoreRun(rust.startCsqttClient(config: config));
     return null;
+  }
+
+  void _attachCoreRun(Future<void> run) {
+    _coreRun = run.then((_) => _onCoreExited(null)).catchError(_onCoreExited);
   }
 
   Future<String?> stop() async {
     if (_coreRun == null) return null;
+    _connectWatchdog?.cancel();
+    _connectWatchdog = null;
     _setState(ConnectState.disconnecting);
     try {
-      await rust.stopCsqttClient();
+      await _stopCore();
       return null;
     } catch (error) {
       _lastError = _cleanError(error);
@@ -385,6 +427,13 @@ class ConnectService extends ChangeNotifier {
     manager.close();
   }
 
+  void _onAllWorkersInactive() {
+    if (_clientRunning && _state == ConnectState.connected) {
+      _setState(ConnectState.connecting);
+      _restartConnectWatchdog();
+    }
+  }
+
   void onCoreLine(String line) {
     _log(line);
 
@@ -420,6 +469,7 @@ class ConnectService extends ChangeNotifier {
           bytesDown: (payload['bytes_down'] as num?)?.toInt() ?? 0,
         );
 
+        if (active == 0) _onAllWorkersInactive();
         if (active > 0 && _state == ConnectState.connecting) {
           _restartConnectWatchdog();
         }
@@ -433,17 +483,18 @@ class ConnectService extends ChangeNotifier {
 
       case 'ACTIVE_ZERO':
         _stats = const ConnectStats();
+        _onAllWorkersInactive();
         notifyListeners();
 
       case 'ERROR':
-        final code = (payload['code'] as num?)?.toInt() ?? 0;
+        final code = payload['code']?.toString() ?? 'unknown';
         final message = payload['message']?.toString() ?? '';
         final fatal = payload['fatal'] == true;
         _log('[ЯДРО] ${fatal ? 'ФАТАЛЬНО' : 'Ошибка'} ($code) $message');
         if (fatal) {
+          // A fatal worker attempt can retry while the core remains alive.
+          // STOPPED or the tracked core future owns the runtime transition.
           _lastError = message.isEmpty ? 'Ошибка ядра' : message;
-          _clientRunning = false;
-          _setState(ConnectState.disconnected);
         }
         notifyListeners();
 
@@ -519,7 +570,7 @@ class ConnectService extends ChangeNotifier {
     }
   }
 
-  int _normalizeWorkers(int? requested) => requested ?? 9;
+  int _normalizeWorkers(int? requested) => normalizeWorkerCount(requested);
 
   int _lastGeneration = 0;
 

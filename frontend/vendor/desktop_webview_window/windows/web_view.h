@@ -35,7 +35,7 @@ class WebView {
 
   void UpdateBounds();
 
-  void Navigate(const std::wstring &url);
+  HRESULT Navigate(const std::wstring &url);
 
   void AddScriptToExecuteOnDocumentCreated(const std::wstring &javaScript);
 
@@ -83,9 +83,13 @@ class WebView {
 
   std::wstring user_data_folder_;
 
+  // Persistent policy set by launch; separate from the single replay bypass.
   bool triggerOnUrlRequestedEvent{true};
+  bool allow_next_replayed_navigation_{false};
 
-  void OnWebviewControllerCreated();
+  HRESULT OnWebviewControllerCreated();
+
+  void FinishCreation(HRESULT result);
 
   [[nodiscard]] bool CanGoBack() const;
 
