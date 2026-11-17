@@ -1,10 +1,10 @@
-﻿// SPDX-FileCopyrightText: 2026 luminescq
+// SPDX-FileCopyrightText: 2026 luminescq
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 import 'package:flutter/material.dart';
 
 class AppColors {
   static const Color background = Color(0xFF0A0A0A);
-  static const Color meshBase = Color(0xFF050508);
+  static const Color meshBase = Color(0xFF09090D);
   static const Color sidebar = Color(0xFF141414);
   static const Color card = Color(0xFF1C1C1C);
 

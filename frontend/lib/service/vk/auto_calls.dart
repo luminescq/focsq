@@ -1,9 +1,10 @@
-﻿// SPDX-FileCopyrightText: 2026 luminescq
+// SPDX-FileCopyrightText: 2026 luminescq
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import '../../l10n/app_locale.dart';
 import '../logs.dart';
 
 class VkApiClient {
@@ -80,10 +81,9 @@ class VkCallStartFailed extends VkCallStartResult {
 }
 
 extension VkApiCalls on VkApiClient {
-
   Future<VkCallStartResult> startCall(String token) async {
     final json = await call('calls.start', token, const {});
-    if (json == null) return const VkCallStartFailed('нет ответа VK API');
+    if (json == null) return VkCallStartFailed(S.vkApiNoResponse);
 
     final error = json['error'];
     if (error is Map<String, dynamic>) {
@@ -95,7 +95,7 @@ extension VkApiCalls on VkApiClient {
 
     final response = json['response'];
     if (response is! Map<String, dynamic>) {
-      return const VkCallStartFailed('нет response в ответе calls.start');
+      return VkCallStartFailed(S.vkNoResponseField);
     }
 
     final callId = response['call_id']?.toString() ?? '';
@@ -103,12 +103,15 @@ extension VkApiCalls on VkApiClient {
     final okJoinLink = response['ok_join_link']?.toString() ?? '';
     var hash = okJoinLink.trim();
     if (hash.isEmpty && joinLink.isNotEmpty) {
-      final segments =
-          joinLink.trim().split('/').where((s) => s.isNotEmpty).toList();
+      final segments = joinLink
+          .trim()
+          .split('/')
+          .where((s) => s.isNotEmpty)
+          .toList();
       hash = segments.isNotEmpty ? segments.last : '';
     }
     if (callId.isEmpty || hash.isEmpty) {
-      return const VkCallStartFailed('пустой call_id/hash в ответе calls.start');
+      return VkCallStartFailed(S.vkEmptyCallId);
     }
     return VkCallStarted(callId: callId, hash: hash);
   }
@@ -144,8 +147,8 @@ class VkAutoCallsManager {
   VkAutoCallsManager({VkApiClient? client}) : _client = client ?? VkApiClient();
 
   static const int maxVkHashes = 6;
-  static const int groupsPerHash = 3;
-  static const int workersPerGroup = 9;
+  static const int groupsPerHash = 1;
+  static const int workersPerGroup = 10;
   static const int _maxAttemptsPerCall = 3;
   static const Duration _smallDelay = Duration(milliseconds: 80);
   static const Duration _largeDelay = Duration(milliseconds: 202);
@@ -195,30 +198,24 @@ class VkAutoCallsManager {
       final result = await _startCallWithAttempts(token);
       switch (result) {
         case final VkCallStarted started:
-          calls.add(
-            VkAutoCall(callId: started.callId, hash: started.hash),
-          );
+          calls.add(VkAutoCall(callId: started.callId, hash: started.hash));
         case final VkCallStartApiError error:
-          LogService().add(
-            '[АВТО API] Звонок не создан · код=${error.code} ${error.message}',
-          );
+          LogService().add(S.callNotCreatedCode(error.code, error.message));
           tokenInvalid = error.tokenInvalid;
           if (tokenInvalid) _tokenInvalidSeen = true;
         case final VkCallStartFailed failure:
-          LogService().add('[АВТО API] Звонок не создан · ${failure.reason}');
+          LogService().add(S.callNotCreated(failure.reason));
       }
       onProgress?.call(calls.length, count);
       if (tokenInvalid) {
-        LogService().add('[АВТО API] Токен недействителен · войдите снова');
+        LogService().add(S.vkTokenInvalidLog);
         return null;
       }
     }
 
     if (calls.isEmpty) return null;
     if (calls.length < count) {
-      LogService().add(
-        '[АВТО API] Звонки ${calls.length}/$count · потоки распределены',
-      );
+      LogService().add(S.callsDistributed(calls.length, count));
     }
     return VkCallsBatch(calls: calls, requestedCalls: count);
   }
@@ -227,17 +224,19 @@ class VkAutoCallsManager {
     if (token.trim().isEmpty || callIds.isEmpty) return 0;
     var finished = 0;
     try {
-      await Future.wait(callIds.map((callId) async {
-        try {
-          if (await _client
-              .forceFinishCall(token, callId)
-              .timeout(_finishTimeout)) {
-            finished++;
-          }
-        } catch (_) {}
-      }));
+      await Future.wait(
+        callIds.map((callId) async {
+          try {
+            if (await _client
+                .forceFinishCall(token, callId)
+                .timeout(_finishTimeout)) {
+              finished++;
+            }
+          } catch (_) {}
+        }),
+      );
     } catch (_) {}
-    LogService().add('[АВТО API] Звонки завершены $finished/${callIds.length}');
+    LogService().add(S.callsFinished(finished, callIds.length));
     return finished;
   }
 

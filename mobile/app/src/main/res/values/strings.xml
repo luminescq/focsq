@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-FileCopyrightText: 2026 amurcanov -->
+<!-- SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0 -->
+
+<resources>
+    <string name="app_name">FOCSQ</string>
+    <string name="widget_disconnected">Отключено</string>
+    <string name="widget_toggle_vpn">Переключить VPN</string>
+    <string name="nav_connection">Подкл.</string>
+    <string name="nav_tunnel">Туннель</string>
+    <string name="nav_deploy">Деплой</string>
+    <string name="nav_exceptions">Маршрут</string>
+    <string name="nav_logs">Логи</string>
+    <string name="nav_info">Инфо</string>
+
+    <string name="action_clear">Очистить</string>
+    <string name="action_copy">Копировать</string>
+    <string name="action_close">Закрыть</string>
+    <string name="quick_settings">Быстрые настройки</string>
+
+    <string name="logs_enabled">Активное логирование</string>
+    <string name="logs_empty_title">Событий пока нет</string>
+    <string name="logs_copied">Логи скопированы</string>
+
+    <string name="exceptions_search_label">Поиск приложений</string>
+    <string name="exceptions_search_placeholder">Название или package name</string>
+    <string name="exceptions_mode_exclude">Чёрный список</string>
+    <string name="exceptions_mode_include">Белый список</string>
+    <string name="exceptions_system_apps">Системные приложения</string>
+    <string name="exceptions_loading">Загружаем список приложений…</string>
+    <string name="exceptions_empty_title">Ничего не найдено</string>
+    <string name="exceptions_empty_description">Измените запрос или включите системные приложения.</string>
+    <string name="exceptions_selected_count">Выбрано: %1$d</string>
+</resources>

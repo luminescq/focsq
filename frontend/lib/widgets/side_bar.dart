@@ -1,8 +1,9 @@
-﻿// SPDX-FileCopyrightText: 2026 luminescq
+// SPDX-FileCopyrightText: 2026 luminescq
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 import 'package:flutter/material.dart';
 import 'package:flutter_svg/flutter_svg.dart';
 
+import '../l10n/app_locale.dart';
 import '../service/update.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_icons.dart';
@@ -42,11 +43,11 @@ class _SideBarState extends State<SideBar> {
     super.dispose();
   }
 
-  static const List<({int index, String asset, String label})> _navItems = [
-    (index: 0, asset: AppIcons.connect, label: 'Подключение'),
-    (index: 1, asset: AppIcons.logs, label: 'Логи'),
-    (index: 2, asset: AppIcons.information, label: 'Информация'),
-    (index: 3, asset: AppIcons.settings, label: 'Настройки'),
+  static List<({int index, String asset, String label})> get _navItems => [
+    (index: 0, asset: AppIcons.connect, label: S.navConnect),
+    (index: 1, asset: AppIcons.logs, label: S.navLogs),
+    (index: 2, asset: AppIcons.information, label: S.navInfo),
+    (index: 3, asset: AppIcons.settings, label: S.navSettings),
   ];
 
   @override
@@ -80,16 +81,23 @@ class _SideBarState extends State<SideBar> {
   }
 
   Widget _buildNavIcon(({int index, String asset, String label}) item) {
+    final shortcut = 'Ctrl+${item.index + 1}';
     return Padding(
       padding: EdgeInsets.only(bottom: item == _navItems.last ? 0 : 16),
-      child: _NavIcon(
-        asset: item.asset,
-        label: item.label,
-        selected: widget.selectedIndex == item.index,
-        onTap: () => widget.onIndexChanged(item.index),
-        showIndicator: item.index == 2 &&
-            UpdateService.hasAvailableUpdate &&
-            !UpdateService.isUpdateDismissed,
+      child: Tooltip(
+        message: '${item.label} ($shortcut)',
+        waitDuration: const Duration(milliseconds: 600),
+        child: _NavIcon(
+          asset: item.asset,
+          label: item.label,
+          shortcut: shortcut,
+          selected: widget.selectedIndex == item.index,
+          onTap: () => widget.onIndexChanged(item.index),
+          showIndicator:
+              item.index == 2 &&
+              UpdateService.hasAvailableUpdate &&
+              !UpdateService.isUpdateDismissed,
+        ),
       ),
     );
   }
@@ -98,6 +106,7 @@ class _SideBarState extends State<SideBar> {
 class _NavIcon extends StatefulWidget {
   final String asset;
   final String label;
+  final String? shortcut;
   final bool selected;
   final VoidCallback onTap;
 
@@ -108,12 +117,15 @@ class _NavIcon extends StatefulWidget {
     required this.label,
     required this.selected,
     required this.onTap,
+    this.shortcut,
     this.showIndicator = false,
   });
 
   @override
   State<_NavIcon> createState() => _NavIconState();
-}class _NavIconState extends State<_NavIcon> {
+}
+
+class _NavIconState extends State<_NavIcon> {
   bool _hovering = false;
 
   static final ColorFilter _activeFilter = const ColorFilter.mode(
@@ -141,7 +153,9 @@ class _NavIcon extends StatefulWidget {
 
     return Semantics(
       button: true,
-      label: widget.label,
+      label: widget.shortcut == null
+          ? widget.label
+          : '${widget.label} (${widget.shortcut})',
       child: MouseRegion(
         cursor: SystemMouseCursors.click,
         onEnter: (_) => setState(() => _hovering = true),
@@ -183,10 +197,7 @@ class _NavIcon extends StatefulWidget {
                     decoration: BoxDecoration(
                       color: AppColors.info,
                       shape: BoxShape.circle,
-                      border: Border.all(
-                        color: AppColors.card,
-                        width: 2.5,
-                      ),
+                      border: Border.all(color: AppColors.card, width: 2.5),
                     ),
                   ),
                 ),

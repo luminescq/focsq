@@ -1,19 +1,29 @@
-﻿// SPDX-FileCopyrightText: 2026 luminescq
+// SPDX-FileCopyrightText: 2026 luminescq
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_svg/flutter_svg.dart';
 
+import '../l10n/app_locale.dart';
+import '../models/app_settings.dart';
+import '../models/profile_group.dart';
 import '../models/server_profile.dart';
 import '../modals/add-profile.dart';
 import '../modals/edit-profile.dart';
+import '../modals/subscription_delete.dart';
+import '../modals/subscription_details_modal.dart';
+import '../modals/subscription_import.dart';
 import '../service/alert.dart';
 import '../service/connect.dart';
 import '../service/db.dart';
 import '../service/import.dart';
+import '../service/subscription_manager.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_icons.dart';
 import '../widgets/connect_button.dart';
 import '../widgets/custom_alert.dart';
+import '../widgets/subscription_card.dart';
 
 class ConnectScreen extends StatefulWidget {
   const ConnectScreen({super.key});
@@ -49,7 +59,7 @@ class _ConnectScreenState extends State<ConnectScreen> {
     if (error == null || !mounted) return;
     CustomAlert.show(
       context,
-      title: 'Ошибка',
+      title: S.errorTitle,
       message: error,
       type: AlertType.warning,
     );
@@ -58,13 +68,13 @@ class _ConnectScreenState extends State<ConnectScreen> {
   String get _statusText {
     switch (ConnectService().state) {
       case ConnectState.disconnected:
-        return 'Подключиться';
+        return S.statusConnect;
       case ConnectState.connecting:
-        return 'Подключение...';
+        return S.statusConnecting;
       case ConnectState.disconnecting:
-        return 'Отключение...';
+        return S.statusDisconnecting;
       case ConnectState.connected:
-        return 'Подключено';
+        return S.statusConnected;
     }
   }
 
@@ -135,7 +145,9 @@ class _ProfilePickerState extends State<_ProfilePicker> {
   bool _expanded = false;
   int? _selectedProfileId;
   bool _isLoading = true;
+  StreamSubscription<AppSettings?>? _settingsSubscription;
   int? _persistedProfileId;
+  String? _refreshingUrl;
 
   void _persistSelection(int? id) {
     if (id == null || id == _persistedProfileId) return;
@@ -145,15 +157,74 @@ class _ProfilePickerState extends State<_ProfilePicker> {
     });
   }
 
+  Future<void> _refreshSubscription(ProfileGroup group) async {
+    final url = group.subscriptionUrl;
+    if (url == null) return;
+    setState(() => _refreshingUrl = url);
+    try {
+      final result = await SubscriptionManager.instance.updateSubscription(url);
+      if (!mounted) return;
+      AlertService.showSubscriptionResult(context, result);
+    } catch (_) {
+      if (!mounted) return;
+      CustomAlert.show(
+        context,
+        title: S.errorTitle,
+        message: S.subscriptionFetchFailed,
+        type: AlertType.warning,
+      );
+    } finally {
+      if (mounted) setState(() => _refreshingUrl = null);
+    }
+  }
+
+  Future<void> _deleteSubscription(ProfileGroup group) async {
+    final title = group.title;
+    final confirmed = await SubscriptionDeleteDialog.show(context, title);
+    if (!mounted || !confirmed) return;
+    try {
+      await SubscriptionManager.instance.deleteSubscription(
+        url: group.subscriptionUrl ?? '',
+        profiles: group.profiles,
+      );
+    } catch (_) {
+      if (!mounted) return;
+      CustomAlert.show(
+        context,
+        title: S.errorTitle,
+        message: S.subscriptionDeleteFailed,
+        type: AlertType.warning,
+      );
+      return;
+    }
+    if (!mounted) return;
+    AlertService.showSubscriptionDeleted(context, title);
+  }
+
   @override
   void initState() {
     super.initState();
     _loadActiveProfile();
+    _settingsSubscription = DbService.watchSettings().listen((settings) {
+      if (!mounted) return;
+      final activeId = settings?.activeProfileId;
+      if (activeId == _selectedProfileId && !_isLoading) return;
+      setState(() {
+        _selectedProfileId = activeId;
+        _isLoading = false;
+      });
+    });
+  }
+
+  @override
+  void dispose() {
+    _settingsSubscription?.cancel();
+    super.dispose();
   }
 
   Future<void> _loadActiveProfile() async {
     final settings = await DbService.getSettings();
-    if (mounted) {
+    if (mounted && _isLoading) {
       setState(() {
         _selectedProfileId = settings.activeProfileId;
         _isLoading = false;
@@ -188,6 +259,99 @@ class _ProfilePickerState extends State<_ProfilePicker> {
         }
 
         final otherProfiles = profiles;
+        final profileGroups = buildProfileGroups(otherProfiles);
+
+        final subscriptionCards = <Widget>[];
+        final standaloneProfiles = <ServerProfile>[];
+
+        for (final group in profileGroups) {
+          if (group.isSubscription && group.showHeader) {
+            subscriptionCards.add(
+              SubscriptionCard(
+                title: group.title,
+                isRefreshing: _refreshingUrl == group.subscriptionUrl,
+                onEdit: () => SubscriptionDetailsModal.show(context, group),
+                onDelete: () => _deleteSubscription(group),
+                onRefresh: group.subscriptionUrl != null
+                    ? () => _refreshSubscription(group)
+                    : null,
+                items: group.profiles
+                    .map(
+                      (p) => SubscriptionItemData(
+                        profile: p,
+                        isSelected: p.id == _selectedProfileId,
+                        onTap: () {
+                          setState(() {
+                            _selectedProfileId = p.id;
+                            _expanded = false;
+                          });
+                          _persistSelection(p.id);
+                        },
+                        onLongPress: () => EditProfileModal.show(context, p),
+                        onEditTap: () => EditProfileModal.show(context, p),
+                      ),
+                    )
+                    .toList(),
+              ),
+            );
+          } else {
+            standaloneProfiles.addAll(group.profiles);
+          }
+        }
+
+        final cards = <Widget>[];
+        for (var i = 0; i < subscriptionCards.length; i++) {
+          cards.add(subscriptionCards[i]);
+          if (i < subscriptionCards.length - 1 ||
+              standaloneProfiles.isNotEmpty) {
+            cards.add(const SizedBox(height: 8));
+          }
+        }
+
+        if (standaloneProfiles.isNotEmpty) {
+          cards.add(
+            Container(
+              decoration: BoxDecoration(
+                color: AppColors.card,
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: Colors.white.withValues(alpha: 0.05)),
+              ),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(12),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: List.generate(standaloneProfiles.length, (index) {
+                    final p = standaloneProfiles[index];
+                    return Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        _ProfileRow(
+                          title: profileNodeName(p),
+                          onTap: () {
+                            setState(() {
+                              _selectedProfileId = p.id;
+                              _expanded = false;
+                            });
+                            _persistSelection(p.id);
+                          },
+                          onLongPress: () => EditProfileModal.show(context, p),
+                          onEditTap: () => EditProfileModal.show(context, p),
+                          showArrow: false,
+                        ),
+                        if (index < standaloneProfiles.length - 1)
+                          Divider(
+                            height: 1,
+                            thickness: 1,
+                            color: Colors.white.withValues(alpha: 0.05),
+                          ),
+                      ],
+                    );
+                  }),
+                ),
+              ),
+            ),
+          );
+        }
 
         return SizedBox(
           width: 320,
@@ -221,60 +385,27 @@ class _ProfilePickerState extends State<_ProfilePicker> {
                 },
                 child: !_expanded || otherProfiles.isEmpty
                     ? const SizedBox(width: double.infinity, height: 0)
-                    : Column(
-                        key: const ValueKey('expanded_profiles'),
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Container(
-                            decoration: BoxDecoration(
-                              color: AppColors.card,
-                              borderRadius: BorderRadius.circular(12),
-                              border: Border.all(
-                                color: Colors.white.withValues(alpha: 0.05),
-                              ),
-                            ),
-                            child: ClipRRect(
-                              borderRadius: BorderRadius.circular(12),
-                              child: Column(
-                                mainAxisSize: MainAxisSize.min,
-                                children: List.generate(otherProfiles.length, (
-                                  index,
-                                ) {
-                                  final p = otherProfiles[index];
-                                  return Column(
-                                    mainAxisSize: MainAxisSize.min,
-                                    children: [
-                                      _ProfileRow(
-                                        title: p.name ?? 'Без имени',
-                                        onTap: () {
-                                          setState(() {
-                                            _selectedProfileId = p.id;
-                                            _expanded = false;
-                                          });
-                                          _persistSelection(p.id);
-                                        },
-                                        onLongPress: () =>
-                                            EditProfileModal.show(context, p),
-                                        onEditTap: () =>
-                                            EditProfileModal.show(context, p),
-                                        showArrow: false,
-                                      ),
-                                      if (index < otherProfiles.length - 1)
-                                        Divider(
-                                          height: 1,
-                                          thickness: 1,
-                                          color: Colors.white.withValues(
-                                            alpha: 0.05,
-                                          ),
-                                        ),
-                                    ],
-                                  );
-                                }),
+                    : Padding(
+                        padding: const EdgeInsets.only(bottom: 12),
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(12),
+                          child: ConstrainedBox(
+                            key: const ValueKey('expanded_profiles'),
+                            constraints: const BoxConstraints(maxHeight: 340),
+                            child: ScrollConfiguration(
+                              behavior: ScrollConfiguration.of(
+                                context,
+                              ).copyWith(scrollbars: false),
+                              child: SingleChildScrollView(
+                                physics: const ClampingScrollPhysics(),
+                                child: Column(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: cards,
+                                ),
                               ),
                             ),
                           ),
-                          const SizedBox(height: 12),
-                        ],
+                        ),
                       ),
               ),
 
@@ -290,7 +421,7 @@ class _ProfilePickerState extends State<_ProfilePicker> {
                   child: ClipRRect(
                     borderRadius: BorderRadius.circular(12),
                     child: _ProfileRow(
-                      title: currentProfile.name ?? 'Без имени',
+                      title: profileDisplayTitle(currentProfile),
                       onTap: () {
                         if (otherProfiles.isNotEmpty) {
                           setState(() => _expanded = !_expanded);
@@ -316,7 +447,7 @@ class _ProfilePickerState extends State<_ProfilePicker> {
                   child: ClipRRect(
                     borderRadius: BorderRadius.circular(12),
                     child: _ProfileRow(
-                      title: 'Нет профилей',
+                      title: S.noProfiles,
                       onTap: () {},
                       showArrow: false,
                       isExpanded: false,
@@ -380,15 +511,18 @@ class _ProfileRowState extends State<_ProfileRow> {
                 size: 18,
               ),
               const SizedBox(width: 12),
-              Text(
-                widget.title,
-                style: const TextStyle(
-                  color: AppColors.textPrimary,
-                  fontSize: 13,
-                  fontWeight: FontWeight.w700,
+              Expanded(
+                child: Text(
+                  widget.title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    color: AppColors.textPrimary,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w700,
+                  ),
                 ),
               ),
-              const Spacer(),
               if (widget.onEditTap != null)
                 GestureDetector(
                   onTap: widget.onEditTap,
@@ -444,7 +578,7 @@ class _AddButtonState extends State<_AddButton> {
 
   void _showMenu() {
     _overlayEntry = OverlayEntry(
-      builder: (context) => Stack(
+      builder: (_) => Stack(
         children: [
           Positioned.fill(
             child: GestureDetector(
@@ -481,7 +615,7 @@ class _AddButtonState extends State<_AddButton> {
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       _MenuItem(
-                        text: 'Вручную',
+                        text: S.addManually,
                         icon: Icons.edit_rounded,
                         onTap: () {
                           _closeMenu();
@@ -489,26 +623,36 @@ class _AddButtonState extends State<_AddButton> {
                         },
                       ),
                       _MenuItem(
-                        text: 'Из буфера (ссылки)',
+                        text: S.addFromClipboard,
                         icon: Icons.content_paste_rounded,
                         onTap: () async {
                           _closeMenu();
                           try {
                             final result =
                                 await ImportService.importFromClipboard();
-                            if (context.mounted) {
-                              AlertService.showImportResult(context, result);
-                            }
+                            if (!mounted) return;
+                            AlertService.showImportResult(context, result);
                           } catch (_) {
-                            if (context.mounted) {
-                              CustomAlert.show(
-                                context,
-                                title: 'Ошибка',
-                                message: 'Не удалось прочитать буфер',
-                                type: AlertType.warning,
-                              );
-                            }
+                            if (!mounted) return;
+                            CustomAlert.show(
+                              context,
+                              title: S.errorTitle,
+                              message: S.clipboardReadFailed,
+                              type: AlertType.warning,
+                            );
                           }
+                        },
+                      ),
+                      _MenuItem(
+                        text: S.addFromSubscription,
+                        icon: Icons.cloud_download_rounded,
+                        onTap: () async {
+                          _closeMenu();
+                          final result = await SubscriptionImportModal.show(
+                            context,
+                          );
+                          if (!mounted || result == null) return;
+                          AlertService.showSubscriptionResult(context, result);
                         },
                       ),
                     ],

@@ -19,14 +19,10 @@ class _CustomTitleBarState extends State<CustomTitleBar> {
   Widget build(BuildContext context) {
     return Container(
       height: 40,
-      decoration: BoxDecoration(
-        color: AppColors.background.withValues(alpha: 0.8),
-        border: Border(
-          bottom: BorderSide(
-            color: Colors.white.withValues(alpha: 0.05),
-            width: 1,
-          ),
-        ),
+      decoration: const BoxDecoration(
+        // Прозрачная шапка: сквозь неё виден зернистый фон, подложки и
+        // линии-отбивки нет.
+        color: Colors.transparent,
       ),
       child: Row(
         children: [

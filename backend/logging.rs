@@ -162,6 +162,10 @@ impl Shared {
     }
 
     fn notify_writer(&self) {
+        let _guard = self
+            .wake_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.wake_generation.fetch_add(1, Ordering::Release);
         self.wake.notify_one();
     }
@@ -191,21 +195,38 @@ impl Shared {
     }
 }
 
+const SINK_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
 struct Sink<W> {
     writer: W,
-    disabled: bool,
+    retry_at: Option<Instant>,
 }
 
 impl<W: Write> Sink<W> {
     fn new(writer: W) -> Self {
         Self {
             writer,
-            disabled: false,
+            retry_at: None,
         }
     }
 
+    fn suspended(&mut self) -> bool {
+        match self.retry_at {
+            Some(retry_at) if Instant::now() < retry_at => true,
+            Some(_) => {
+                self.retry_at = None;
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn suspend(&mut self) {
+        self.retry_at = Some(Instant::now() + SINK_RETRY_INTERVAL);
+    }
+
     fn write_line(&mut self, value: &str, repetitions: usize) {
-        if self.disabled {
+        if self.suspended() {
             return;
         }
         let result = catch_unwind(AssertUnwindSafe(|| {
@@ -225,17 +246,17 @@ impl<W: Write> Sink<W> {
             self.writer.write_all(line.as_bytes())
         }));
         if !matches!(result, Ok(Ok(()))) {
-            self.disabled = true;
+            self.suspend();
         }
     }
 
     fn flush(&mut self) {
-        if self.disabled {
+        if self.suspended() {
             return;
         }
         let result = catch_unwind(AssertUnwindSafe(|| self.writer.flush()));
         if !matches!(result, Ok(Ok(()))) {
-            self.disabled = true;
+            self.suspend();
         }
     }
 }

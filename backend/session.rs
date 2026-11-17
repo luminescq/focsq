@@ -6,21 +6,23 @@ use crate::{
     client_perf::{self, Stage as PerfStage},
     dispatcher::{Dispatcher, PacketReceiver, WorkerChannels, packet_channel},
     events::Events,
-    obfs::{ObfsCipher, ObfsConfig, ObfsMode, ObfsState, is_rtp_packet},
+    obfs::{ObfsCipher, ObfsConfig, ObfsMode, ObfsState, SessionCipher, is_rtp_packet},
     packet::{PacketBuf, PacketPool},
     protocol::{
         ConfigResponse, config_request, disconnect_request, is_config_response,
-        is_control_response, is_panel_restart_notice, parse_config_response, parse_stream_alive,
-        parse_stream_repair,
+        is_control_response, is_panel_restart_notice, is_worker_limit_error, parse_config_response,
+        parse_stream_alive, parse_stream_repair, parse_tunworkers_response, workers_request,
     },
     repair::RepairState,
     selective_fec,
+    srtp_mode::SrtpMode,
     stats::Stats,
     striped_scheduler::PacketClass,
     turn::{TurnAllocation, TurnConnectTarget, TurnReceiver, TurnRequestError},
     turn_endpoint::{TurnTransportMode, resolve_turn_endpoints},
 };
 use anyhow::{Context, Result, anyhow, bail};
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 #[cfg(test)]
 use std::time::Instant;
@@ -29,27 +31,29 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::{Notify, mpsc, oneshot},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
 
-const CONFIG_RESPONSE_TIMEOUT_MS: [u64; 3] = [750, 1_500, 3_000];
+const CONFIG_RESPONSE_TIMEOUT_MS: [u64; 4] = [400, 800, 1600, 3000];
+const DTLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(8000);
+const DTLS_RETRANSMIT_TIMEOUT: Duration = Duration::from_millis(500);
 const DEALLOCATE_TIMEOUT: Duration = Duration::from_millis(700);
 const CONNECT_CANCEL_GRACE: Duration = Duration::from_secs(1);
 const SESSION_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const DISCONNECT_SEND_TIMEOUT: Duration = Duration::from_millis(300);
-const DISCONNECT_ACK_TIMEOUT: Duration = Duration::from_millis(350);
-const DISCONNECT_CONTROL_ATTEMPTS: usize = 2;
+const DISCONNECT_ACK_TIMEOUT: Duration = Duration::from_millis(600);
+const DISCONNECT_CONTROL_ATTEMPTS: usize = 3;
 const WORKER_LATENCY_CAPACITY: usize = crate::striped_scheduler::SMALL_DATAGRAM_BATCH;
 const WORKER_PRIORITY_CAPACITY: usize = crate::striped_scheduler::MEDIUM_DATAGRAM_BATCH;
 const WORKER_BULK_CAPACITY: usize = crate::striped_scheduler::BULK_DATAGRAM_BATCH;
-const WRITER_COMMAND_CAPACITY: usize = 16;
+const WRITER_COMMAND_CAPACITY: usize = 256;
 const WRITER_LATENCY_BATCH_LIMIT: usize = crate::striped_scheduler::SMALL_DATAGRAM_BATCH;
 const WRITER_PRIORITY_BATCH_LIMIT: usize = crate::striped_scheduler::MEDIUM_DATAGRAM_BATCH;
 const WRITER_BULK_BATCH_LIMIT: usize = crate::striped_scheduler::BULK_DATAGRAM_BATCH;
@@ -93,7 +97,9 @@ pub struct SessionConfig {
     pub turn_endpoint_cursor: usize,
     pub salt: Arc<str>,
     pub mode: ObfsMode,
+    pub srtp_mode: SrtpMode,
     pub wrap_key: [u8; 32],
+    pub client_wrap_key: [u8; 32],
     pub get_config: bool,
     pub desired_count: usize,
     pub server_stream_repair: Arc<AtomicBool>,
@@ -112,6 +118,54 @@ pub struct SessionRuntime {
     pub ready_tx: Option<oneshot::Sender<()>>,
     pub allocation_started: Option<oneshot::Sender<()>>,
     pub allocation_ready: Option<oneshot::Sender<()>>,
+    pub target_workers: Option<Arc<AtomicUsize>>,
+    pub scale_notify: Option<Arc<Notify>>,
+    pub configured_workers: usize,
+}
+
+#[derive(Clone, Copy)]
+struct WorkerScale<'a> {
+    notify: Option<&'a Arc<Notify>>,
+    target: Option<&'a Arc<AtomicUsize>>,
+    configured: usize,
+}
+
+fn apply_workers_limit(
+    agreed: usize,
+    target_workers: Option<&Arc<AtomicUsize>>,
+    scale_notify: Option<&Arc<Notify>>,
+) {
+    let effective = agreed.max(1);
+    if let Some(target) = target_workers {
+        let previous = target.swap(effective, Ordering::AcqRel);
+        if previous != effective
+            && let Some(notify) = scale_notify
+        {
+            notify.notify_waiters();
+        }
+    }
+}
+
+fn current_max_workers(
+    target_workers: Option<&Arc<AtomicUsize>>,
+    configured_workers: usize,
+) -> usize {
+    target_workers
+        .map(|target| target.load(Ordering::Acquire))
+        .unwrap_or(configured_workers)
+        .max(1)
+}
+
+fn parse_workers_from_tunconf(text: &str) -> Option<usize> {
+    for part in text.split(':') {
+        if let Some(count) = part
+            .strip_prefix("workers=")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+        {
+            return Some(count);
+        }
+    }
+    None
 }
 
 fn build_registration_payload(config: &SessionConfig) -> Bytes {
@@ -142,7 +196,8 @@ impl ConfigDeliveryState {
 
 struct TransportShared {
     allocation: Arc<TurnAllocation>,
-    cipher: ObfsCipher,
+    cipher: ArcSwap<SessionCipher>,
+    recv_cipher: ArcSwap<SessionCipher>,
     config: ObfsConfig,
     pool: Arc<PacketPool>,
 }
@@ -152,7 +207,6 @@ struct TransportWriter {
     write_state: ObfsState,
     fec_budget: selective_fec::Budget,
     pending_data: VecDeque<PacketBuf>,
-    mmsg_data: Vec<PacketBuf>,
 }
 
 struct TransportReader {
@@ -188,6 +242,10 @@ struct ReaderRuntime {
     repair: Arc<RepairState>,
     shutdown: Arc<ShutdownCoordinator>,
     config_tx: mpsc::Sender<String>,
+    routing_reassembler: RoutingReassembler,
+    target_workers: Option<Arc<AtomicUsize>>,
+    scale_notify: Option<Arc<Notify>>,
+    configured_workers: usize,
 }
 
 pub struct ShutdownCoordinator {
@@ -252,7 +310,7 @@ impl ShutdownCoordinator {
         activity.store(self.next_activity(), Ordering::Release);
     }
 
-    async fn request_disconnect(&self, device_id: &str, salt: &str) {
+    async fn request_disconnect(&self, password: &str, salt: &str) {
         let leader = {
             let mut state = self.lock_state();
             if state.active {
@@ -268,7 +326,7 @@ impl ShutdownCoordinator {
             return;
         }
 
-        let request = disconnect_request(device_id, salt);
+        let request = disconnect_request(password, salt);
         for writer in self
             .control_streams()
             .into_iter()
@@ -455,15 +513,210 @@ impl ReplayWindow {
 }
 
 fn authenticate_inbound(
-    cipher: &ObfsCipher,
+    cipher: &SessionCipher,
     config: &ObfsConfig,
     replay: &mut ReplayProtection,
     packet: &mut PacketBuf,
 ) -> bool {
+    if cipher.is_plain() {
+        return true;
+    }
     is_rtp_packet(packet.as_slice())
         && cipher
             .unwrap(packet, config.mode)
             .is_ok_and(|sequence| replay.rtp.accept_rtp(sequence))
+}
+
+fn wrap_key_material(config: &SessionConfig) -> crate::dtls::DtlsSrtpKeys {
+    let key_to_use = if config.client_wrap_key != [0; 32] {
+        &config.client_wrap_key
+    } else {
+        &config.wrap_key
+    };
+    crate::dtls::derive_dtls_srtp_deterministic(key_to_use)
+}
+
+fn cipher_pair(
+    keys: crate::dtls::DtlsSrtpKeys,
+) -> Result<(Arc<SessionCipher>, Arc<SessionCipher>)> {
+    Ok((
+        Arc::new(SessionCipher::Obfs(Arc::new(ObfsCipher::new(
+            keys.client_cipher_key,
+        )?))),
+        Arc::new(SessionCipher::Obfs(Arc::new(ObfsCipher::new(
+            keys.server_cipher_key,
+        )?))),
+    ))
+}
+
+fn install_cipher_pair(shared: &TransportShared, pair: (Arc<SessionCipher>, Arc<SessionCipher>)) {
+    shared.cipher.store(pair.0);
+    shared.recv_cipher.store(pair.1);
+}
+
+async fn install_session_ciphers(
+    shared: &Arc<TransportShared>,
+    writer: &mut TransportWriter,
+    reader: &mut TransportReader,
+    config: &SessionConfig,
+    events: &Events,
+) -> Result<()> {
+    if !config.srtp_mode.uses_dtls() {
+        install_cipher_pair(shared, cipher_pair(wrap_key_material(config))?);
+        crate::log_error!(
+            "[СЕССИЯ #{}] SRTP: {} (legacy WRAP, общий ключ)",
+            config.id,
+            config.srtp_mode.as_str()
+        );
+        return Ok(());
+    }
+    match run_dtls_handshake(writer, reader, config).await {
+        Ok(keys) => {
+            install_cipher_pair(shared, cipher_pair(keys)?);
+            if config.id == 1 {
+                crate::log_error!("[СЕССИЯ #{}] SRTP: DTLS-SRTP включён", config.id);
+            }
+            events.dtls(config.id, "DTLS-рукопожатие успешно (ECDSA P-256)");
+            Ok(())
+        }
+        Err(error) => {
+            events.dtls(config.id, &format!("рукопожатие не состоялось ({error:#})"));
+            crate::log_error!("[СЕССИЯ #{}] DTLS-SRTP не состоялся ({error:#})", config.id);
+            if config.srtp_mode.falls_back_to_wrap() {
+                crate::log_error!(
+                    "[СЕССИЯ #{}] SRTP: AUTO fallback -> WRAP-SRTP (legacy режим)",
+                    config.id
+                );
+                events.dtls(config.id, "AUTO fallback -> WRAP-SRTP");
+                install_cipher_pair(shared, cipher_pair(wrap_key_material(config))?);
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+async fn run_dtls_handshake(
+    writer: &mut TransportWriter,
+    reader: &mut TransportReader,
+    config: &SessionConfig,
+) -> Result<crate::dtls::DtlsSrtpKeys> {
+    let mut handshake = crate::dtls::DtlsClientHandshake::new()?;
+    let mut flight = handshake.start()?;
+    if config.id == 1 {
+        crate::log_error!(
+            "[СЕССИЯ #{}] DTLS: старт рукопожатия WebRTC (ClientHello {} байт)",
+            config.id,
+            flight.len()
+        );
+    }
+    writer.send_bytes(&flight).await?;
+    let started = tokio::time::Instant::now();
+    let deadline = started + DTLS_HANDSHAKE_TIMEOUT;
+    let mut retransmit_at = started + DTLS_RETRANSMIT_TIMEOUT;
+    let mut retransmits = 0u32;
+    let mut inbound_datagrams = 0u32;
+    while !handshake.is_connected() {
+        if tokio::time::Instant::now() >= deadline {
+            crate::log_error!(
+                "[СЕССИЯ #{}] DTLS: таймаут за {} мс (состояние {}, датаграмм {}, повторов {})",
+                config.id,
+                DTLS_HANDSHAKE_TIMEOUT.as_millis(),
+                handshake_message_label(&handshake),
+                inbound_datagrams,
+                retransmits
+            );
+            bail!("DTLS handshake did not finish in time");
+        }
+        tokio::select! {
+            biased;
+            result = reader.recv() => {
+                let packet = result?;
+                inbound_datagrams += 1;
+                let reply = match handshake.handle_datagram(packet.as_slice()) {
+                    Ok(reply) => reply,
+                    Err(err) => {
+                        if config.id == 1 {
+                            crate::log_error!(
+                                "[СЕССИЯ #{}] DTLS: пропущен некорректный пакет ({err:#})",
+                                config.id
+                            );
+                        }
+                        None
+                    }
+                };
+                match reply {
+                    Some(bytes) => {
+                        if config.id == 1 {
+                            crate::log_error!(
+                                "[СЕССИЯ #{}] DTLS: ответ серверу ({} байт, #{}), отправлено {}, состояние {}",
+                                config.id,
+                                packet.len(),
+                                inbound_datagrams,
+                                bytes.len(),
+                                handshake_message_label(&handshake)
+                            );
+                        }
+                        writer.send_bytes(&bytes).await?;
+                        flight = bytes;
+                        retransmits = 0;
+                        retransmit_at = tokio::time::Instant::now() + DTLS_RETRANSMIT_TIMEOUT;
+                    }
+                    None => {
+                        if config.id == 1 && inbound_datagrams <= 2 {
+                            crate::log_error!(
+                                "[СЕССИЯ #{}] DTLS: ответ серверу не нужен ({} байт, #{}), состояние {}",
+                                config.id,
+                                packet.len(),
+                                inbound_datagrams,
+                                handshake_message_label(&handshake)
+                            );
+                        }
+                    }
+                }
+            }
+            _ = tokio::time::sleep_until(retransmit_at) => {
+                retransmits += 1;
+                if config.id == 1 || retransmits >= 3 {
+                    crate::log_error!(
+                        "[СЕССИЯ #{}] DTLS: повтор полёта #{} ({} байт, состояние {})",
+                        config.id,
+                        retransmits,
+                        flight.len(),
+                        handshake_message_label(&handshake)
+                    );
+                }
+                writer.send_bytes(&flight).await?;
+                retransmit_at = tokio::time::Instant::now() + DTLS_RETRANSMIT_TIMEOUT;
+            }
+        }
+    }
+    let keys = handshake
+        .srtp_keys()
+        .copied()
+        .ok_or_else(|| anyhow!("DTLS handshake finished without SRTP keying material"))?;
+    if config.id == 1 {
+        crate::log_error!(
+            "[СЕССИЯ #{}] DTLS: рукопожатие завершено за {} мс (датаграмм {}, повторов {}), ключи SRTP получены",
+            config.id,
+            started.elapsed().as_millis(),
+            inbound_datagrams,
+            retransmits
+        );
+    }
+    Ok(keys)
+}
+
+fn handshake_message_label(handshake: &crate::dtls::DtlsClientHandshake) -> &'static str {
+    match handshake.state() {
+        crate::dtls::DtlsHandshakeState::Idle => "Idle",
+        crate::dtls::DtlsHandshakeState::AwaitingServerFlight => "ждём полёт сервера",
+        crate::dtls::DtlsHandshakeState::AwaitingServerFinished => "ждём Finished сервера",
+        crate::dtls::DtlsHandshakeState::AwaitingClientFlight => "ждём полёт клиента",
+        crate::dtls::DtlsHandshakeState::Connected => "Connected",
+        crate::dtls::DtlsHandshakeState::Failed => "Failed",
+    }
 }
 
 struct ActiveConnection {
@@ -508,6 +761,18 @@ impl Drop for ActiveConnection {
     }
 }
 
+fn duplicate_plain_packet(pool: &Arc<PacketPool>, packet: &PacketBuf) -> Option<PacketBuf> {
+    let mut copy = pool.try_acquire()?;
+    let source = packet.as_slice();
+    let area = copy.read_area();
+    if source.len() > area.len() {
+        return None;
+    }
+    area[..source.len()].copy_from_slice(source);
+    copy.set_read_len(source.len()).ok()?;
+    Some(copy)
+}
+
 impl TransportWriter {
     fn new(shared: Arc<TransportShared>) -> Self {
         Self {
@@ -515,33 +780,34 @@ impl TransportWriter {
             write_state: ObfsState::new(),
             fec_budget: selective_fec::Budget::new(),
             pending_data: VecDeque::with_capacity(WRITER_BULK_BATCH_LIMIT),
-            mmsg_data: Vec::with_capacity(WRITER_BULK_BATCH_LIMIT),
         }
     }
 
     async fn send_data(&mut self, packet: PacketBuf) -> Result<()> {
-        self.send_packet(packet).await?;
-        Ok(())
+        self.send_packet(packet).await
     }
 
     async fn send_packet(&mut self, mut packet: PacketBuf) -> Result<()> {
-        let duplicate = self.prepare_packet(&mut packet)?;
-        self.shared
-            .allocation
-            .send_with_duplicate(packet, duplicate)
-            .await?;
+        let duplicate =
+            selective_fec::should_duplicate(packet.as_slice()) && self.fec_budget.allow();
+        let echo_packet = duplicate
+            .then(|| duplicate_plain_packet(&self.shared.pool, &packet))
+            .flatten();
+        self.wrap_packet(&mut packet)?;
+        self.shared.allocation.send(packet).await?;
+        if let Some(mut copy) = echo_packet
+            && self.wrap_packet(&mut copy).is_ok()
+        {
+            let _ = self.shared.allocation.send(copy).await;
+        }
         Ok(())
     }
 
-    fn prepare_packet(&mut self, packet: &mut PacketBuf) -> Result<bool> {
-        let duplicate =
-            selective_fec::should_duplicate(packet.as_slice()) && self.fec_budget.allow();
+    fn wrap_packet(&mut self, packet: &mut PacketBuf) -> Result<()> {
+        let cipher = self.shared.cipher.load();
         client_perf::measure_sampled(PerfStage::CryptoObfs, 64, || {
-            self.shared
-                .cipher
-                .wrap(packet, &self.shared.config, &mut self.write_state)
-        })?;
-        Ok(duplicate)
+            cipher.wrap(packet, &self.shared.config, &mut self.write_state)
+        })
     }
 
     fn queue_data(&mut self, packet: PacketBuf) {
@@ -550,39 +816,9 @@ impl TransportWriter {
     }
 
     async fn flush_queued_data(&mut self) -> Result<()> {
-        if self.pending_data.len() == 1
-            && let Some(packet) = self.pending_data.pop_front()
-        {
-            return self.send_data(packet).await;
+        while let Some(packet) = self.pending_data.pop_front() {
+            self.send_data(packet).await?;
         }
-
-        while let Some(mut packet) = self.pending_data.pop_front() {
-            if self.prepare_packet(&mut packet)? {
-                self.flush_mmsg_data().await?;
-                self.shared
-                    .allocation
-                    .send_with_duplicate(packet, true)
-                    .await?;
-                continue;
-            }
-
-            self.mmsg_data.push(packet);
-            if self.mmsg_data.len() == WRITER_BULK_BATCH_LIMIT {
-                self.flush_mmsg_data().await?;
-            }
-        }
-        self.flush_mmsg_data().await
-    }
-
-    async fn flush_mmsg_data(&mut self) -> Result<()> {
-        if self.mmsg_data.is_empty() {
-            return Ok(());
-        }
-        self.shared
-            .allocation
-            .send_data_batch(&mut self.mmsg_data)
-            .await?;
-        self.mmsg_data.clear();
         Ok(())
     }
 
@@ -619,13 +855,9 @@ impl TransportReader {
                 .await
                 .context("TURN allocation receive")?;
             client_perf::observe(PerfStage::TurnRx);
+            let cipher = self.shared.recv_cipher.load();
             let accepted = client_perf::measure_sampled(PerfStage::CryptoObfs, 64, || {
-                authenticate_inbound(
-                    &self.shared.cipher,
-                    &self.shared.config,
-                    &mut self.replay,
-                    &mut packet,
-                )
+                authenticate_inbound(&cipher, &self.shared.config, &mut self.replay, &mut packet)
             });
             if accepted {
                 return Ok(packet);
@@ -747,20 +979,39 @@ async fn run_allocated_session(
     );
     let shared = Arc::new(TransportShared {
         allocation,
-        cipher: ObfsCipher::new(config.wrap_key)?,
+        cipher: ArcSwap::new(Arc::new(SessionCipher::Plain)),
+        recv_cipher: ArcSwap::new(Arc::new(SessionCipher::Plain)),
         config: ObfsConfig::new(config.mode),
         pool: runtime.pool.clone(),
     });
     let mut writer_transport = TransportWriter::new(shared.clone());
-    let mut reader_transport = TransportReader::new(shared, turn_receiver);
+    let mut reader_transport = TransportReader::new(shared.clone(), turn_receiver);
+    install_session_ciphers(
+        &shared,
+        &mut writer_transport,
+        &mut reader_transport,
+        &config,
+        &runtime.events,
+    )
+    .await
+    .context("negotiating SRTP")?;
     let incarnation_id = NEXT_INCARNATION_ID.fetch_add(1, Ordering::Relaxed).max(1);
     let config_tx = config.get_config.then(|| runtime.config_tx.clone());
+    let scale = WorkerScale {
+        notify: runtime.scale_notify.as_ref(),
+        target: runtime.target_workers.as_ref(),
+        configured: runtime.configured_workers,
+    };
+    let mut routing_reassembler = RoutingReassembler::new();
     let config_delivered = match request_configuration(
         &mut writer_transport,
         &mut reader_transport,
         &config,
         &runtime.events,
+        &runtime.dispatcher,
+        &mut routing_reassembler,
         config_tx,
+        scale,
     )
     .await
     {
@@ -778,6 +1029,12 @@ async fn run_allocated_session(
             return Err(error);
         }
     };
+    if let Some(target) = &runtime.target_workers
+        && config.id > target.load(Ordering::Acquire)
+        && config.id > runtime.configured_workers
+    {
+        return Ok(false);
+    }
     let (latency_tx, latency_rx) = packet_channel(WORKER_LATENCY_CAPACITY, true);
     let (priority_tx, priority_rx) = packet_channel(WORKER_PRIORITY_CAPACITY, true);
     let (bulk_tx, bulk_rx) = packet_channel(WORKER_BULK_CAPACITY, true);
@@ -824,6 +1081,10 @@ async fn run_allocated_session(
             repair: config.repair.clone(),
             shutdown: runtime.shutdown.clone(),
             config_tx: runtime.config_tx.clone(),
+            routing_reassembler,
+            target_workers: runtime.target_workers.clone(),
+            scale_notify: runtime.scale_notify.clone(),
+            configured_workers: runtime.configured_workers,
         },
         session_cancel.clone(),
     ));
@@ -833,8 +1094,26 @@ async fn run_allocated_session(
         _ = runtime.cancel.cancelled() => {
             runtime
                 .shutdown
-                .request_disconnect(&config.device_id, &config.salt)
+                .request_disconnect(&config.password, &config.salt)
                 .await;
+            (Ok(()), 0)
+        }
+        _ = async {
+            if let (Some(notify), Some(target)) = (&runtime.scale_notify, &runtime.target_workers) {
+                loop {
+                    let notified = notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    let current_target = target.load(Ordering::Acquire);
+                    if config.id > current_target && config.id > runtime.configured_workers {
+                        break;
+                    }
+                    notified.await;
+                }
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {
             (Ok(()), 0)
         }
         _ = config.repair.changed(config.id, repair_generation) => {
@@ -882,10 +1161,26 @@ async fn request_configuration(
     reader: &mut TransportReader,
     config: &SessionConfig,
     events: &Events,
+    dispatcher: &Dispatcher,
+    routing_reassembler: &mut RoutingReassembler,
     config_tx: Option<mpsc::Sender<String>>,
+    scale: WorkerScale<'_>,
 ) -> Result<bool> {
     let request = build_registration_payload(config);
     'attempts: for (attempt, timeout_ms) in CONFIG_RESPONSE_TIMEOUT_MS.into_iter().enumerate() {
+        if !config.srtp_mode.uses_dtls()
+            && config.client_wrap_key != [0; 32]
+            && config.client_wrap_key != config.wrap_key
+        {
+            let key = if attempt % 2 == 0 {
+                config.client_wrap_key
+            } else {
+                config.wrap_key
+            };
+            if let Ok(pair) = cipher_pair(crate::dtls::derive_dtls_srtp_deterministic(&key)) {
+                install_cipher_pair(&writer.shared, pair);
+            }
+        }
         writer
             .send_bytes(request.as_ref())
             .await
@@ -897,6 +1192,30 @@ async fn request_configuration(
                     let packet = result.context("GETCONF чтение ответа конфига")?;
                     if is_panel_restart_notice(packet.as_slice()) {
                         events.panel_restart();
+                        continue;
+                    }
+                    if packet.as_slice().starts_with(b"ROUTING:") {
+                        if let Some(payload) = routing_reassembler.feed(packet.as_slice()) {
+                            events.routing(&payload);
+                            dispatcher.update_domain_routing(&payload);
+                        }
+                        continue;
+                    }
+                    if packet.as_slice().starts_with(b"TUNWORKERS:")
+                        || packet.as_slice().starts_with(b"WORKERS:")
+                    {
+                        if let Some((agreed, server_limit)) =
+                            parse_tunworkers_response(packet.as_slice())
+                        {
+                            crate::log_error!(
+                                "[ВОРКЕР #{}] TUNWORKERS: согласовано {}, лимит сервера {}",
+                                config.id,
+                                agreed,
+                                server_limit
+                            );
+                            events.workers(server_limit as u32);
+                            apply_workers_limit(agreed, scale.target, scale.notify);
+                        }
                         continue;
                     }
                     if !is_config_response(packet.as_slice()) {
@@ -918,19 +1237,32 @@ async fn request_configuration(
             }
         };
         let response = parse_config_response(packet.as_slice()).inspect_err(|error| {
+            if !config.get_config {
+                return;
+            }
             let message = error.to_string();
-            if config.get_config && message.contains("FATAL_") {
+            if is_worker_limit_error(error) {
+                events.error("worker_limit", &message, true);
+            } else if message.contains("FATAL_") {
                 events.error("handshake_rejected", &message, true);
             }
         })?;
         match response {
             ConfigResponse::NoConfig => return Ok(false),
             ConfigResponse::Config(value) => {
+                let _ = writer.send_bytes(b"READY").await;
                 if value.ends_with(":stream-v1") || value.ends_with(":stream-v2") {
                     config.server_stream_repair.store(true, Ordering::Release);
                 }
+                if let Some(agreed) = parse_workers_from_tunconf(&value) {
+                    apply_workers_limit(agreed, scale.target, scale.notify);
+                }
                 if let Some(sender) = &config_tx {
                     let _ = sender.try_send(value);
+                }
+                if config.get_config {
+                    let request = workers_request(&config.password, scale.configured);
+                    let _ = writer.send_bytes(request.as_bytes()).await;
                 }
                 crate::log_error!("[ВОРКЕР #{}] Конфиг получен", config.id);
                 return Ok(true);
@@ -957,6 +1289,7 @@ async fn writer_loop(
         shutdown,
         activity,
     } = runtime;
+    let keepalive_interval = Duration::from_secs(10);
     loop {
         if let Ok(command) = commands.try_recv() {
             handle_writer_command(&mut transport, command).await?;
@@ -976,6 +1309,7 @@ async fn writer_loop(
                     }
                     continue;
                 }
+                _ = tokio::time::sleep(keepalive_interval) => None,
                 packet = latency.recv(&cancel) => packet.map(|packet| WriterPacket {
                     packet,
                     class: PacketClass::Small,
@@ -996,6 +1330,9 @@ async fn writer_loop(
             {
                 return Ok(());
             }
+            // Idle keepalive 2.5.0: сервер различает [0xff;4] и не считает
+            // простоя активностью сессии.
+            let _ = transport.send_bytes(&[0xff; 4]).await;
             continue;
         };
         let sent = send_writer_batch(&mut transport, next, &latency, &priority, &bulk).await?;
@@ -1101,6 +1438,105 @@ fn next_writer_packet(
         })
 }
 
+const MAX_ROUTING_CHUNKS: usize = 8192;
+
+#[derive(Default)]
+struct RoutingReassembler {
+    total_chunks: usize,
+    chunks: Vec<Option<String>>,
+    received_count: usize,
+    finished: bool,
+}
+
+impl RoutingReassembler {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn feed(&mut self, payload: &[u8]) -> Option<String> {
+        let text = std::str::from_utf8(payload).ok()?;
+        let rest = text.strip_prefix("ROUTING:")?;
+        if let Some(total_str) = rest.strip_prefix("START:") {
+            let total: usize = total_str.trim().parse().ok()?;
+            if total == 0 || total > MAX_ROUTING_CHUNKS {
+                return None;
+            }
+            if self.total_chunks != total {
+                self.total_chunks = total;
+                self.chunks = vec![None; total];
+                self.received_count = 0;
+                self.finished = false;
+            }
+            return None;
+        }
+        if let Some(total_str) = rest.strip_prefix("FINISH:") {
+            let total: usize = total_str.trim().parse().ok()?;
+            if total == 0 || total > MAX_ROUTING_CHUNKS {
+                return None;
+            }
+            if self.total_chunks != total {
+                self.total_chunks = total;
+                self.chunks = vec![None; total];
+                self.received_count = 0;
+            }
+            self.finished = true;
+            if self.received_count == self.total_chunks && self.total_chunks > 0 {
+                return self.assemble();
+            }
+            return None;
+        }
+        let mut parts = rest.splitn(3, ':');
+        let seq_str = parts.next()?;
+        let total_str = parts.next()?;
+        let chunk_data = parts.next()?;
+        let seq: usize = seq_str.trim().parse().ok()?;
+        let total: usize = total_str.trim().parse().ok()?;
+        if total == 0 || total > MAX_ROUTING_CHUNKS || seq == 0 || seq > total {
+            return None;
+        }
+        if self.total_chunks != total {
+            self.total_chunks = total;
+            self.chunks = vec![None; total];
+            self.received_count = 0;
+            self.finished = false;
+        }
+        if self.chunks[seq - 1].is_none() {
+            self.chunks[seq - 1] = Some(chunk_data.to_string());
+            self.received_count += 1;
+        }
+        if self.finished && self.received_count == self.total_chunks && self.total_chunks > 0 {
+            return self.assemble();
+        }
+        None
+    }
+
+    fn assemble(&mut self) -> Option<String> {
+        use base64::Engine;
+        let mut b64_combined = String::new();
+        for chunk in &self.chunks {
+            b64_combined.push_str(chunk.as_deref().unwrap_or_default());
+        }
+        self.chunks.clear();
+        self.received_count = 0;
+        self.total_chunks = 0;
+        self.finished = false;
+
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(b64_combined.trim())
+            .ok()?;
+        if decoded.len() >= 2 && decoded[0] == 0x1f && decoded[1] == 0x8b {
+            use flate2::read::GzDecoder;
+            use std::io::Read;
+            let mut gz = GzDecoder::new(&decoded[..]);
+            let mut decompressed = String::new();
+            if gz.read_to_string(&mut decompressed).is_ok() {
+                return Some(decompressed);
+            }
+        }
+        String::from_utf8(decoded).ok()
+    }
+}
+
 async fn reader_loop(
     mut transport: TransportReader,
     runtime: ReaderRuntime,
@@ -1112,6 +1548,10 @@ async fn reader_loop(
         repair,
         shutdown,
         config_tx,
+        mut routing_reassembler,
+        target_workers,
+        scale_notify,
+        configured_workers,
     } = runtime;
     // [FOCSQ] Диагностика первого data-пакета от пира: если его нет при
     // «Отправлено → 0 получено», сервер молчит на наши data-пакеты;
@@ -1131,7 +1571,8 @@ async fn reader_loop(
             continue;
         }
         if let Some(command) = parse_stream_repair(packet.as_slice()) {
-            let result = repair.apply_repair(&command);
+            let max_workers = current_max_workers(target_workers.as_ref(), configured_workers);
+            let result = repair.apply_repair(&command, max_workers);
             if result.restarts != 0 {
                 crate::log_error!(
                     "[REPAIR] Сервер запросил перезапуск потоков {:?}, sequence {}, resets {}",
@@ -1143,7 +1584,8 @@ async fn reader_loop(
             continue;
         }
         if let Some(command) = parse_stream_alive(packet.as_slice()) {
-            repair.apply_alive(&command);
+            let max_workers = current_max_workers(target_workers.as_ref(), configured_workers);
+            repair.apply_alive(&command, max_workers);
             continue;
         }
         if shutdown.observe_control_response(packet.as_slice()) {
@@ -1151,11 +1593,43 @@ async fn reader_loop(
         }
         if packet.as_slice().starts_with(b"TUNCONF:") {
             if let Ok(ConfigResponse::Config(config)) = parse_config_response(packet.as_slice()) {
+                if let Some(agreed) = parse_workers_from_tunconf(&config) {
+                    apply_workers_limit(agreed, target_workers.as_ref(), scale_notify.as_ref());
+                }
                 let _ = config_tx.try_send(config);
             }
             continue;
         }
+        if packet.as_slice().starts_with(b"ROUTING:") {
+            if let Some(payload) = routing_reassembler.feed(packet.as_slice()) {
+                events.routing(&payload);
+                dispatcher.update_domain_routing(&payload);
+            }
+            continue;
+        }
+        if packet.as_slice().starts_with(b"TUNWORKERS:")
+            || packet.as_slice().starts_with(b"WORKERS:")
+        {
+            if let Some((agreed, server_limit)) = parse_tunworkers_response(packet.as_slice()) {
+                crate::log_error!(
+                    "[СЕССИЯ] TUNWORKERS: согласовано {}, лимит сервера {}",
+                    agreed,
+                    server_limit
+                );
+                events.workers(server_limit as u32);
+                apply_workers_limit(agreed, target_workers.as_ref(), scale_notify.as_ref());
+            }
+            continue;
+        }
         if is_control_response(packet.as_slice()) {
+            continue;
+        }
+        // [FOCSQ→апстрим 2.5.0] У сервера v2.5.0 длинные даунлинк-пакеты
+        // (более MAX_FRAG_PAYLOAD) приходят фрагментами с магией 0xCF
+        // (shared/wire_protocol.rs); собирает их ShardedReassembler
+        // в диспетчере. Голые IP-пакеты идут как раньше.
+        if packet.as_slice().first().copied() == Some(crate::wire_protocol::CSQTT_FRAG_MAGIC) {
+            dispatcher.handle_incoming_fragment(packet.as_slice());
             continue;
         }
         // [FOCSQ] В TUN можно писать только IP-пакеты. Служебные ответы
@@ -1163,15 +1637,11 @@ async fn reader_loop(
         // ядро отвергло бы их записью EINVAL, что раньше убивало задачу
         // записи TUN навсегда — туннель «зависал» без трафика.
         //
-        // TCP-downlink приходит в туннельном фрейме CQF1 (24 байта,
-        // shared/flow_frame.rs), который снимается только позже — в
-        // ReturnReorder::push. Сырой фрейм начинается с 'C' (0x43 →
-        // IHL = 3) и is_ip_packet его отвергает, поэтому проверяется
-        // payload фрейма. payload() не трогает байты без magic CQF1,
-        // так что служебные ответы и некадрированные пакеты (UDP)
-        // ведут себя как раньше; сам пакет для ReturnReorder остаётся
-        // нетронутым — фрейм нужен там для reorder'а.
-        let payload = crate::flow_frame::payload(packet.as_slice());
+        // Префикс 24-байтового кадра (наш родной CQF1 от сервера FOCSQ/
+        // апстрима ≤2.1.x) снимается позже — в strip_legacy_downlink_prefix
+        // диспетчера, поэтому проверка допускает IP-пакет, спрятанный
+        // за 24 байтовым префиксом.
+        let payload = packet.as_slice();
         if !is_ip_packet(payload) {
             dropped_non_ip += 1;
             if dropped_non_ip <= 8 || dropped_non_ip.is_multiple_of(1000) {
@@ -1187,10 +1657,7 @@ async fn reader_loop(
         }
         if !logged_first_data {
             logged_first_data = true;
-            crate::log_error!(
-                "[СЕССИЯ] Первый data-пакет от пира: {} байт",
-                packet.len()
-            );
+            crate::log_error!("[СЕССИЯ] Первый data-пакет от пира: {} байт", packet.len());
         }
         deliver_inbound_packet(&dispatcher, packet);
     }
@@ -1200,17 +1667,23 @@ fn deliver_inbound_packet(dispatcher: &Dispatcher, packet: PacketBuf) {
     dispatcher.return_packet(packet);
 }
 
-/// [FOCSQ] Пакет (или payload туннельного фрейма) пригоден для записи в TUN.
+/// [FOCSQ] Пакет (или пакет за 24-байтовым префиксом кадра) пригоден для
+/// записи в TUN.
 ///
 /// Ядро Linux принимает в TUN только валидные пакеты IPv4/IPv6; всё прочее
 /// (служебные однобайтовые ответы сервера, усечённые или мусорные датаграммы)
 /// запись отвергает с `EINVAL`. Раньше такая запись убивала задачу записи TUN
 /// навсегда, поэтому непригодные пакеты отбрасываются ещё в reader_loop.
 ///
-/// Важно: вызывать на `flow_frame::payload(...)`, а не на сырых байтах —
-/// TCP-downlink приходит в фрейме CQF1 (24 байта), чей первый байт
-/// `'C'` (0x43) читается как IPv4 с IHL = 3 и провалил бы проверку.
+/// Голый IP-пакет (сервер 2.5.0) или IP-пакет за 24-байтовым префиксом
+/// CQF1-кадра (наш сервер/апстрим ≤2.1.x) — оба проходят; снятие префикса —
+/// в диспетчере. Важно: не подавать сюда сырой фрейм как 'C' (0x43) —
+/// это читается как IPv4 с IHL=3; потому и допускаем префикс явно.
 fn is_ip_packet(packet: &[u8]) -> bool {
+    is_plain_ip_packet(packet) || (packet.len() > 24 && is_plain_ip_packet(&packet[24..]))
+}
+
+fn is_plain_ip_packet(packet: &[u8]) -> bool {
     match packet.first().map(|byte| byte >> 4) {
         Some(4) => {
             if packet.len() < 20 {
@@ -1291,6 +1764,8 @@ mod tests {
             salt: Arc::from(""),
             mode: ObfsMode::Audio,
             wrap_key: [0; 32],
+            srtp_mode: SrtpMode::Wrap,
+            client_wrap_key: [0; 32],
             get_config: false,
             desired_count: 18,
             server_stream_repair: Arc::new(AtomicBool::new(false)),
@@ -1318,6 +1793,8 @@ mod tests {
             salt: Arc::from("generation-id"),
             mode: ObfsMode::Audio,
             wrap_key: [0; 32],
+            srtp_mode: SrtpMode::Wrap,
+            client_wrap_key: [0; 32],
             get_config: true,
             desired_count: 9,
             server_stream_repair: Arc::new(AtomicBool::new(false)),
@@ -1340,14 +1817,14 @@ mod tests {
 
         let coordinator = shutdown.clone();
         let task = tokio::spawn(async move {
-            coordinator.request_disconnect("device", "salt").await;
+            coordinator.request_disconnect("password", "salt").await;
         });
         let command = tokio::time::timeout(Duration::from_millis(100), older_rx.recv())
             .await
             .unwrap_or(None);
         let completion = match command {
             Some(WriterCommand::SendBytes { data, completion }) => {
-                assert_eq!(data.as_ref(), b"DISCONNECT:device|salt");
+                assert_eq!(data.as_ref(), b"DISCONNECT:password|salt");
                 completion
             }
             None => panic!("shutdown did not select the active control stream"),
@@ -1375,7 +1852,7 @@ mod tests {
 
         let coordinator = shutdown.clone();
         let task = tokio::spawn(async move {
-            coordinator.request_disconnect("device", "salt").await;
+            coordinator.request_disconnect("password", "salt").await;
         });
         let command = tokio::time::timeout(Duration::from_millis(100), active_rx.recv())
             .await
@@ -1895,7 +2372,8 @@ mod tests {
     #[test]
     fn plaintext_corruption_and_replay_never_authenticate() {
         let pool = PacketPool::new(5);
-        let cipher = ObfsCipher::new([0x52; 32]).unwrap();
+        let cipher = Arc::new(ObfsCipher::new([0x52; 32]).unwrap());
+        let session_cipher = SessionCipher::Obfs(cipher.clone());
         let config = ObfsConfig::new(ObfsMode::Video);
         let mut replay = ReplayProtection::default();
         let mut encoded = pool.acquire();
@@ -1911,7 +2389,7 @@ mod tests {
         plaintext.read_area()[..6].copy_from_slice(b"DENIED");
         plaintext.set_read_len(6).unwrap();
         assert!(!authenticate_inbound(
-            &cipher,
+            &session_cipher,
             &config,
             &mut replay,
             &mut plaintext
@@ -1924,7 +2402,7 @@ mod tests {
         corrupt.read_area()[..corrupt_wire.len()].copy_from_slice(&corrupt_wire);
         corrupt.set_read_len(corrupt_wire.len()).unwrap();
         assert!(!authenticate_inbound(
-            &cipher,
+            &session_cipher,
             &config,
             &mut replay,
             &mut corrupt
@@ -1934,7 +2412,7 @@ mod tests {
         valid.read_area()[..wire.len()].copy_from_slice(&wire);
         valid.set_read_len(wire.len()).unwrap();
         assert!(authenticate_inbound(
-            &cipher,
+            &session_cipher,
             &config,
             &mut replay,
             &mut valid
@@ -1945,7 +2423,7 @@ mod tests {
         replayed.read_area()[..wire.len()].copy_from_slice(&wire);
         replayed.set_read_len(wire.len()).unwrap();
         assert!(!authenticate_inbound(
-            &cipher,
+            &session_cipher,
             &config,
             &mut replay,
             &mut replayed
@@ -2086,36 +2564,32 @@ mod tests {
     }
 
     #[test]
-    fn ip_filter_accepts_tcp_packets_inside_flow_frame() {
-        // TCP-downlink приходит в туннельном фрейме CQF1 (24 байта):
-        // magic + sender_id + flow_id + sequence. Сырой фрейм начинается
-        // с 'C' (0x43 → IHL=3 → header_len=12 < 20) и отвергался бы,
-        // поэтому reader_loop проверяет payload после заголовка.
+    fn ip_filter_accepts_packets_behind_legacy_prefix() {
+        // Голый IP-пакет (сервер 2.5.0) и IP-пакет за 24-байтовым
+        // префиксом legacy-кадра (наш сервер/апстрим ≤2.1.x) оба проходят.
         let mut framed = vec![0u8; 24 + 60];
         framed[..4].copy_from_slice(b"CQF1");
-        framed[24] = 0x45; // IPv4 внутри фрейма
-        assert!(is_ip_packet(crate::flow_frame::payload(&framed)));
+        // IPv4-box за префиксом (IHL=4, total_len=60 — хватит на пакет)
+        framed[24..28].copy_from_slice(&[0x45u8, 0x00, 0x00, 0x3c]);
+        assert!(is_ip_packet(&framed));
 
-        // IPv6 внутри фрейма
+        // IPv6 за префиксом
         framed[24] = 0x60;
-        assert!(is_ip_packet(crate::flow_frame::payload(&framed)));
+        assert!(is_ip_packet(&framed));
 
-        // Мусор внутри фрейма — отбрасывается
+        // Мусор за префиксом — отбрасывается
         framed[24] = 0x55;
-        assert!(!is_ip_packet(crate::flow_frame::payload(&framed)));
+        assert!(!is_ip_packet(&framed));
 
-        // Payload короче минимального IP-заголовка — отбрасывается
-        let mut framed = vec![0u8; 24 + 4];
-        framed[..4].copy_from_slice(b"CQF1");
-        framed[24] = 0x45;
-        assert!(!is_ip_packet(crate::flow_frame::payload(&framed)));
+        // За префиксом короче минимального IP-заголовка — отбрасывается
+        let framed = vec![0u8; 24 + 10];
+        assert!(!is_ip_packet(&framed));
 
-        // Пакет без magic CQF1 payload() возвращает без изменений:
-        // служебные ответы и UDP не затрагиваются
-        assert!(!is_ip_packet(crate::flow_frame::payload(&[0xff])));
+        // Служебные ответы (0xFF) не затрагиваются
+        assert!(!is_ip_packet(&[0xff]));
         assert!(
-            is_ip_packet(crate::flow_frame::payload(&[0x45; 60])),
-            "некадрированный IPv4 должен проверяться как есть"
+            is_ip_packet(&[0x45; 60]),
+            "голый IPv4 должен проверяться как есть"
         );
     }
 }

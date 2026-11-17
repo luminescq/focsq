@@ -176,11 +176,12 @@ void WebView::OnWebviewControllerCreated() {
 
               // Capture URI string before async callback
               std::wstring uri_string(uri.get());
+              navigation_cancelling_ = true;
 
               auto result_handler =
                   std::make_unique<flutter::MethodResultFunctions<>>(
-                      [uri_string, sender,
-                       this](const flutter::EncodableValue *success_value) {
+                      [uri_string, this](
+                          const flutter::EncodableValue *success_value) {
                         bool letPass = false;
                         if (success_value && 
                             std::holds_alternative<bool>(*success_value)) {
@@ -188,7 +189,8 @@ void WebView::OnWebviewControllerCreated() {
                         }
                         if (letPass) {
                           this->setTriggerOnUrlRequestedEvent(false);
-                          sender->Navigate(uri_string.c_str());
+                          this->pending_navigation_url_ = uri_string;
+                          this->NavigatePending();
                         }
                       },
                       nullptr, nullptr);
@@ -227,6 +229,8 @@ void WebView::OnWebviewControllerCreated() {
             method_channel_->InvokeMethod(
                 "onNavigationCompleted",
                 std::make_unique<flutter::EncodableValue>(method_args));
+            navigation_cancelling_ = false;
+            NavigatePending();
             return S_OK;
           })
           .Get(),
@@ -278,6 +282,15 @@ void WebView::Navigate(const std::wstring &url) {
   } else {
     std::cerr << "webview not created" << std::endl;
   }
+}
+
+void WebView::NavigatePending() {
+  if (navigation_cancelling_ || pending_navigation_url_.empty()) {
+    return;
+  }
+  std::wstring url = std::move(pending_navigation_url_);
+  pending_navigation_url_.clear();
+  Navigate(url);
 }
 
 void WebView::AddScriptToExecuteOnDocumentCreated(

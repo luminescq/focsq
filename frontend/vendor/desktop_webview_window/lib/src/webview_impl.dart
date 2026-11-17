@@ -124,7 +124,8 @@ class WebviewImpl extends Webview {
   }
 
   @override
-  void launch(String url, {bool triggerOnUrlRequestEvent = true}) async {
+  Future<void> launch(String url,
+      {bool triggerOnUrlRequestEvent = true}) async {
     await channel.invokeMethod("launch", {
       "url": url,
       "viewId": viewId,

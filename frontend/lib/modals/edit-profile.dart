@@ -1,12 +1,15 @@
-﻿// SPDX-FileCopyrightText: 2026 luminescq
+// SPDX-FileCopyrightText: 2026 luminescq
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 import 'package:flutter/material.dart';
+
+import '../l10n/app_locale.dart';
 import 'profile_form_components.dart';
 import '../theme/app_colors.dart';
 import '../models/server_profile.dart';
 import '../service/alert.dart';
 import '../service/db.dart';
 import '../service/import.dart';
+import '../service/worker_limits.dart';
 
 class EditProfileModal extends StatefulWidget {
   final ServerProfile profile;
@@ -52,8 +55,9 @@ class _EditProfileModalState extends State<EditProfileModal> {
   late final TextEditingController _ipCtrl;
   late final TextEditingController _portCtrl;
   late final TextEditingController _passCtrl;
-  double _power = 9;
-  double _maxPower = 90;
+  double _power = 10;
+  double _maxPower = 100;
+  double _requestedPower = 10;
 
   String? _ipError;
   String? _portError;
@@ -68,7 +72,10 @@ class _EditProfileModalState extends State<EditProfileModal> {
       text: widget.profile.port?.toString() ?? '',
     );
     _passCtrl = TextEditingController(text: widget.profile.password);
-    _power = widget.profile.power?.toDouble() ?? 9;
+    _requestedPower = widget.profile.power?.toDouble() ?? 10;
+    // До загрузки лимита держим значение в пределах дефолтного максимума,
+    // иначе Slider падает на value > max в первом кадре.
+    _power = _requestedPower.clamp(10, _maxPower).toDouble();
     _ipCtrl.addListener(() => _clearError(() => _ipError = null));
     _portCtrl.addListener(() => _clearError(() => _portError = null));
     _passCtrl.addListener(() => _clearError(() => _passError = null));
@@ -84,8 +91,14 @@ class _EditProfileModalState extends State<EditProfileModal> {
     final settings = await DbService.getSettings();
     if (!mounted) return;
     setState(() {
-      _maxPower = resolveMaxPowerThreads(settings).toDouble();
-      if (_power > _maxPower) _power = _maxPower;
+      final subLimit = widget.profile.subscriptionUrl != null
+          ? widget.profile.threadsLimit ?? widget.profile.power
+          : null;
+      _maxPower = WorkerLimits.maxPowerForProfile(
+        settings,
+        threadsLimit: subLimit,
+      ).toDouble();
+      _power = _requestedPower.clamp(10, _maxPower).toDouble();
     });
   }
 
@@ -105,9 +118,9 @@ class _EditProfileModalState extends State<EditProfileModal> {
     final password = _passCtrl.text.trim();
 
     setState(() {
-      _ipError = ip.isEmpty ? 'Укажите IP' : null;
-      _portError = ImportService.isValidPort(port) ? null : 'Порт: 1–65535';
-      _passError = password.isEmpty ? 'Укажите пароль' : null;
+      _ipError = ip.isEmpty ? S.errIpRequired : null;
+      _portError = ImportService.isValidPort(port) ? null : S.errPortRange;
+      _passError = password.isEmpty ? S.errPassRequired : null;
     });
     if (_ipError != null || _portError != null || _passError != null) {
       return;
@@ -124,12 +137,12 @@ class _EditProfileModalState extends State<EditProfileModal> {
     Navigator.pop(context);
     AlertService.showProfileUpdated(
       context,
-      widget.profile.name ?? 'Без имени',
+      widget.profile.name ?? S.unnamedProfile,
     );
   }
 
   Future<void> _deleteProfile() async {
-    final name = widget.profile.name ?? 'Без имени';
+    final name = widget.profile.name ?? S.unnamedProfile;
     await DbService.deleteProfile(widget.profile.id);
     if (!mounted) return;
     Navigator.pop(context);
@@ -146,7 +159,7 @@ class _EditProfileModalState extends State<EditProfileModal> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            const ModalTopBar(title: 'Редактировать профиль'),
+            ModalTopBar(title: S.editProfile),
             const SizedBox(height: 8),
             Container(
               width: double.infinity,
@@ -160,16 +173,19 @@ class _EditProfileModalState extends State<EditProfileModal> {
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const SectionDivider(text: 'Данные профиля'),
+                  SectionDivider(text: S.profileData),
                   const SizedBox(height: 16),
-                  CustomTextField(hint: 'Имя профиля', controller: _nameCtrl),
+                  CustomTextField(
+                    hint: S.profileNameHint,
+                    controller: _nameCtrl,
+                  ),
                   const SizedBox(height: 12),
                   Row(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Expanded(
                         child: CustomTextField(
-                          hint: 'IP-адрес',
+                          hint: S.ipHint,
                           controller: _ipCtrl,
                           error: _ipError,
                         ),
@@ -177,7 +193,7 @@ class _EditProfileModalState extends State<EditProfileModal> {
                       const SizedBox(width: 12),
                       Expanded(
                         child: CustomTextField(
-                          hint: 'Порт',
+                          hint: S.port,
                           controller: _portCtrl,
                           error: _portError,
                         ),
@@ -188,7 +204,7 @@ class _EditProfileModalState extends State<EditProfileModal> {
                     height: (_ipError != null || _portError != null) ? 4 : 12,
                   ),
                   CustomTextField(
-                    hint: 'Пароль профиля',
+                    hint: S.passwordHint,
                     controller: _passCtrl,
                     error: _passError,
                   ),
@@ -197,8 +213,8 @@ class _EditProfileModalState extends State<EditProfileModal> {
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      const Text(
-                        'Мощность',
+                      Text(
+                        S.power,
                         style: TextStyle(
                           color: AppColors.textPrimary,
                           fontSize: 12,
@@ -206,7 +222,7 @@ class _EditProfileModalState extends State<EditProfileModal> {
                         ),
                       ),
                       Text(
-                        '${_power.toInt()} потоков',
+                        S.threadsCount(_power.toInt()),
                         style: const TextStyle(
                           color: AppColors.textPrimary,
                           fontSize: 12,
@@ -232,10 +248,15 @@ class _EditProfileModalState extends State<EditProfileModal> {
                     ),
                     child: Slider(
                       value: _power,
-                      min: 9,
+                      min: 10,
                       max: _maxPower,
-                      divisions: ((_maxPower - 9) / 9).round(),
-                      onChanged: (v) => setState(() => _power = v),
+                      divisions: sliderDivisionsFor(_maxPower),
+                      onChanged: _maxPower > 10
+                          ? (v) => setState(() {
+                              _power = v;
+                              _requestedPower = v;
+                            })
+                          : null,
                     ),
                   ),
                   const SizedBox(height: 16),
@@ -255,8 +276,8 @@ class _EditProfileModalState extends State<EditProfileModal> {
                                 borderRadius: BorderRadius.circular(10),
                               ),
                             ),
-                            child: const Text(
-                              'Сохранить',
+                            child: Text(
+                              S.save,
                               style: TextStyle(
                                 fontSize: 14,
                                 fontWeight: FontWeight.w800,
@@ -279,8 +300,8 @@ class _EditProfileModalState extends State<EditProfileModal> {
                                 borderRadius: BorderRadius.circular(10),
                               ),
                             ),
-                            child: const Text(
-                              'Удалить',
+                            child: Text(
+                              S.delete,
                               style: TextStyle(
                                 fontSize: 14,
                                 fontWeight: FontWeight.w700,

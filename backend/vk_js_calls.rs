@@ -21,7 +21,7 @@ const VK_CLIENT_ID: &str = "6287487";
 const OK_APPLICATION_KEY: &str = "CGMMEJLGDIHBABABA";
 const DEFAULT_OK_API: &str = "https://calls.okcdn.ru/fb.do";
 const MAX_RESPONSE_BYTES: usize = 512 * 1024;
-pub const MAX_ACCOUNT_CREDENTIALS: usize = 9;
+pub const MAX_ACCOUNT_CREDENTIALS: usize = 15;
 
 #[derive(Deserialize)]
 pub struct Bootstrap {
@@ -421,6 +421,11 @@ async fn post_form(
         .await
         .context("HTTP-запрос")?;
     let status = response.status();
+    if let Some(length) = response.content_length()
+        && length > MAX_RESPONSE_BYTES as u64
+    {
+        bail!("слишком большой HTTP-ответ");
+    }
     let bytes = response.bytes().await.context("чтение HTTP-ответа")?;
     if bytes.len() > MAX_RESPONSE_BYTES {
         bail!("слишком большой HTTP-ответ");
@@ -585,8 +590,8 @@ mod tests {
     }
 
     #[test]
-    fn account_credentials_are_bounded_to_nine_sessions() {
-        assert_eq!(MAX_ACCOUNT_CREDENTIALS, 9);
+    fn account_credentials_are_bounded_to_fifteen_sessions() {
+        assert_eq!(MAX_ACCOUNT_CREDENTIALS, 15);
     }
 
     #[test]

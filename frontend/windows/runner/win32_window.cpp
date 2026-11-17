@@ -2,6 +2,7 @@
 
 #include <dwmapi.h>
 #include <flutter_windows.h>
+#include <windowsx.h>
 
 #include "resource.h"
 
@@ -179,6 +180,77 @@ Win32Window::MessageHandler(HWND hwnd,
                             WPARAM const wparam,
                             LPARAM const lparam) noexcept {
   switch (message) {
+    case WM_NCCALCSIZE: {
+      // Кастомный тайтлбар: клиент занимает всё окно, системной рамки нет.
+      // window_manager с TitleBarStyle.hidden вставлял сюда 8px-инсеты
+      // (left/right/bottom) — непокрытые полосы оставались белыми, и ни один
+      // DWM-атрибут их не красит, поэтому клиент должен покрывать всё окно.
+      if (!wparam) {
+        break;
+      }
+      if (IsZoomed(hwnd)) {
+        // Максимизированное окно вылезает за монитор на ширину рамки —
+        // выравниваем клиент по рабочей области, иначе края контента
+        // обрежутся экраном.
+        auto *sz = reinterpret_cast<NCCALCSIZE_PARAMS *>(lparam);
+        HMONITOR monitor =
+            MonitorFromRect(&sz->rgrc[0], MONITOR_DEFAULTTONEAREST);
+        MONITORINFO info = {};
+        info.cbSize = sizeof(info);
+        if (monitor != nullptr && GetMonitorInfo(monitor, &info)) {
+          LONG dx = sz->rgrc[0].left - info.rcWork.left;
+          LONG dy = sz->rgrc[0].top - info.rcWork.top;
+          sz->rgrc[0].left -= dx;
+          sz->rgrc[0].right += dx;
+          sz->rgrc[0].top -= dy;
+          sz->rgrc[0].bottom += dy;
+        }
+      }
+      return 0;
+    }
+    case WM_NCHITTEST: {
+      // Клиент теперь покрывает всё окно — зоны ресайза по периметру
+      // (внешние 8px) обслуживаем вручную, иначе DefWindowProc вернёт
+      // HTCLIENT и окно нельзя будет тянуть за край.
+      if (IsZoomed(hwnd)) {
+        break;
+      }
+      POINT pt = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+      RECT rect;
+      if (!GetWindowRect(hwnd, &rect)) {
+        break;
+      }
+      const LONG border = 8;
+      const bool left = pt.x < rect.left + border;
+      const bool right = pt.x >= rect.right - border;
+      const bool top = pt.y < rect.top + border;
+      const bool bottom = pt.y >= rect.bottom - border;
+      if (top && left) {
+        return HTTOPLEFT;
+      }
+      if (top && right) {
+        return HTTOPRIGHT;
+      }
+      if (bottom && left) {
+        return HTBOTTOMLEFT;
+      }
+      if (bottom && right) {
+        return HTBOTTOMRIGHT;
+      }
+      if (left) {
+        return HTLEFT;
+      }
+      if (right) {
+        return HTRIGHT;
+      }
+      if (top) {
+        return HTTOP;
+      }
+      if (bottom) {
+        return HTBOTTOM;
+      }
+      break;
+    }
     case WM_DESTROY:
       window_handle_ = nullptr;
       Destroy();
@@ -285,4 +357,19 @@ void Win32Window::UpdateTheme(HWND const window) {
     DwmSetWindowAttribute(window, DWMWA_USE_IMMERSIVE_DARK_MODE,
                           &enable_dark_mode, sizeof(enable_dark_mode));
   }
+
+  // Win11 рисует вокруг top-level окна системную рамку светлого цвета — на
+  // тёмном приложении с hidden title bar она читается как белая линия.
+  // Убираем совсем; атрибут есть только на Win11 (22000+), на Win10 вызов
+  // просто вернёт ошибку — там такой рамки нет.
+  COLORREF border_color = DWMWA_COLOR_NONE;
+  DwmSetWindowAttribute(window, DWMWA_BORDER_COLOR, &border_color,
+                        sizeof(border_color));
+
+  // Скругление углов: DWM знает только пресеты ROUND (~8px) и
+  // ROUNDSMALL (~4px), произвольный радиус не задать. На Win10 атрибута
+  // нет — углы останутся прямыми.
+  UINT corner_preference = DWMWCP_ROUND;
+  DwmSetWindowAttribute(window, DWMWA_WINDOW_CORNER_PREFERENCE,
+                        &corner_preference, sizeof(corner_preference));
 }

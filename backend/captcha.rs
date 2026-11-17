@@ -58,7 +58,11 @@ fn debug_dump(tag: &str, text: &str) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|value| value.as_millis())
         .unwrap_or_default();
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = writeln!(file, "\n===== [{millis}] {tag} =====");
         let _ = file.write_all(text.as_bytes());
     }
@@ -282,14 +286,10 @@ impl CaptchaSolver {
                 return Ok(token);
             }
             Err(error) => {
-                crate::log_error!(
-                    "[STREAM {stream_id}] [КАПЧА] AUTO: WBV Auto ошибка: {error}"
-                );
+                crate::log_error!("[STREAM {stream_id}] [КАПЧА] AUTO: WBV Auto ошибка: {error}");
             }
         }
-        crate::log_error!(
-            "[STREAM {stream_id}] [КАПЧА] AUTO: повторное окно (ручной режим, 60s)"
-        );
+        crate::log_error!("[STREAM {stream_id}] [КАПЧА] AUTO: повторное окно (ручной режим, 60s)");
         self.webview(stream_id, captcha, "manual", Duration::from_secs(60))
             .await
             .with_context(|| "automatic captcha chain failed; manual fallback failed")
@@ -305,6 +305,7 @@ impl CaptchaSolver {
         if captcha.redirect_uri.is_empty() || captcha.session_token.is_empty() {
             bail!("webview captcha data is incomplete");
         }
+        validated_captcha_url(&captcha.redirect_uri)?;
         let mut receiver = self.result_rx.lock().await;
         while receiver.try_recv().is_ok() {}
         crate::log_output!(
@@ -448,6 +449,7 @@ impl CaptchaSession<'_> {
         if std::env::var_os("ONLY_PRINT_URL").is_some() {
             bail!("ONLY_PRINT_URL active, skipping solve");
         }
+        validated_captcha_url(&captcha.redirect_uri)?;
         let html = self.fetch_html(&captcha.redirect_uri).await?;
         let mut page = parse_page(&html)?;
         if let Some(init) = &page.init {
@@ -457,10 +459,7 @@ impl CaptchaSession<'_> {
             "PARSED page",
             &format!(
                 "pow_difficulty={}, pow_input={}, script_url={}, debug_info={}",
-                page.pow_difficulty,
-                page.pow_input,
-                page.script_url,
-                page.debug_info
+                page.pow_difficulty, page.pow_input, page.script_url, page.debug_info
             ),
         );
         if !page.script_url.starts_with("http://") && !page.script_url.starts_with("https://") {
@@ -468,9 +467,9 @@ impl CaptchaSession<'_> {
                 page.script_url = base
                     .join(&page.script_url)
                     .map(|url| url.to_string())
-                    .unwrap_or_else(|_| format!("https://id.vk.com{}", page.script_url));
+                    .unwrap_or_else(|_| format!("https://id.vk.ru{}", page.script_url));
             } else {
-                page.script_url = format!("https://id.vk.com{}", page.script_url);
+                page.script_url = format!("https://id.vk.ru{}", page.script_url);
             }
         }
         if page.pow_input.is_empty() {
@@ -486,7 +485,7 @@ impl CaptchaSession<'_> {
                         .map(|(_, value)| value.into_owned())
                 })
                 .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| "vk.com".to_owned());
+                .unwrap_or_else(|| "vk.ru".to_owned());
             match self
                 .request(
                     "captchaNotRobot.initSession",
@@ -573,7 +572,7 @@ impl CaptchaSession<'_> {
                         .map(|(_, value)| value.into_owned())
                 })
                 .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| "vk.com".to_owned());
+                .unwrap_or_else(|| "vk.ru".to_owned());
             match self
                 .request(
                     "captchaNotRobot.initSession",
@@ -680,8 +679,8 @@ impl CaptchaSession<'_> {
                 &endpoint,
                 Some(values),
                 &[
-                    ("origin", "https://id.vk.com"),
-                    ("referer", "https://id.vk.com/"),
+                    ("origin", "https://id.vk.ru"),
+                    ("referer", "https://id.vk.ru/"),
                     ("priority", "u=1, i"),
                 ],
             )
@@ -734,24 +733,24 @@ impl CaptchaSession<'_> {
         headers.insert("sec-fetch-dest", header::HeaderValue::from_static("empty"));
         headers.insert(
             header::ORIGIN,
-            header::HeaderValue::from_static("https://vk.com"),
+            header::HeaderValue::from_static("https://vk.ru"),
         );
         headers.insert(
             header::REFERER,
-            header::HeaderValue::from_static("https://vk.com/"),
+            header::HeaderValue::from_static("https://vk.ru/"),
         );
         for (name, value) in extra {
             insert_header(&mut headers, name, value)?;
         }
-        let mut request = self.client.request(method.clone(), endpoint).headers(headers);
+        let mut request = self
+            .client
+            .request(method.clone(), endpoint)
+            .headers(headers);
         if let Some(values) = form {
             request = request
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
                 .body(encode_form(values));
-            debug_dump(
-                &format!("REQ {method} {endpoint}"),
-                &encode_form(values),
-            );
+            debug_dump(&format!("REQ {method} {endpoint}"), &encode_form(values));
         } else {
             debug_dump(&format!("REQ {method} {endpoint}"), "(no body)");
         }
@@ -779,7 +778,7 @@ impl CaptchaSession<'_> {
                 "captchaNotRobot.check",
                 &[
                     ("session_token", session_token),
-                    ("domain", "vk.com"),
+                    ("domain", "vk.ru"),
                     ("adFp", ""),
                     ("accelerometer", "[]"),
                     ("gyroscope", "[]"),
@@ -839,7 +838,7 @@ impl CaptchaSession<'_> {
             "captchaNotRobot.componentDone",
             &[
                 ("session_token", session_token),
-                ("domain", "vk.com"),
+                ("domain", "vk.ru"),
                 ("adFp", ""),
                 ("browser_fp", browser_fp),
                 ("device", device),
@@ -894,6 +893,32 @@ impl CaptchaSession<'_> {
     }
 }
 
+const ALLOWED_CAPTCHA_DOMAINS: [&str; 2] = ["vk.ru", "vk.com"];
+
+fn validated_captcha_url(raw: &str) -> Result<Url> {
+    let url = Url::parse(raw).context("captcha redirect_uri is not a valid URL")?;
+    if url.scheme() != "https" {
+        bail!("captcha redirect_uri must use https");
+    }
+    if url.port().is_some() {
+        bail!("captcha redirect_uri must use the default https port");
+    }
+    let host = url.host_str().unwrap_or_default();
+    if !is_allowed_captcha_host(host) {
+        bail!("captcha redirect_uri host is not allowed");
+    }
+    Ok(url)
+}
+
+fn is_allowed_captcha_host(host: &str) -> bool {
+    ALLOWED_CAPTCHA_DOMAINS.iter().any(|domain| {
+        host == *domain
+            || host
+                .strip_suffix(domain)
+                .is_some_and(|prefix| prefix.ends_with('.'))
+    })
+}
+
 fn parse_page(html: &str) -> Result<CaptchaPage> {
     let init: Option<CaptchaInit> = match extract_window_init(html) {
         Ok(raw) => Some(serde_json::from_str(&raw).context("captcha init json parse")?),
@@ -911,7 +936,7 @@ fn parse_page(html: &str) -> Result<CaptchaPage> {
         .as_ref()
         .and_then(|regex| regex.captures(html))
         .map(|captures| captures[1].to_owned())
-        .unwrap_or_else(|| "https://id.vk.com/js/api/oauth.js".to_owned());
+        .unwrap_or_else(|| "https://id.vk.ru/js/api/oauth.js".to_owned());
     let mut pow_input = POW_INPUT
         .as_ref()
         .and_then(|regex| regex.captures(html))
@@ -1044,7 +1069,7 @@ fn solve_pow(input: &str, difficulty: usize, cancel: &CancellationToken) -> Resu
 fn base_values(session_token: &str) -> Vec<(&str, &str)> {
     vec![
         ("session_token", session_token),
-        ("domain", "vk.com"),
+        ("domain", "vk.ru"),
         ("adFp", ""),
         ("access_token", ""),
     ]
@@ -1170,7 +1195,7 @@ mod tests {
             "error_code": 14,
             "captcha_sid": 123,
             "captcha_ts": 99,
-            "redirect_uri": "https://id.vk.com/captcha?session_token=abc"
+            "redirect_uri": "https://id.vk.ru/captcha?session_token=abc"
         }))
         .unwrap();
         assert_eq!(error.captcha_sid, "123");
@@ -1214,5 +1239,16 @@ mod tests {
     #[test]
     fn invalid_balanced_window_init_is_not_silently_ignored() {
         assert!(parse_page(r#"<script>window.init={"data":]};</script>"#).is_err());
+    }
+
+    #[test]
+    fn captcha_url_must_be_https_and_on_vk_domains() {
+        assert!(validated_captcha_url("https://id.vk.ru/captcha?session_token=a").is_ok());
+        assert!(validated_captcha_url("https://id.vk.ru/captcha?session_token=a").is_ok());
+        assert!(validated_captcha_url("http://id.vk.ru/captcha").is_err());
+        assert!(validated_captcha_url("https://evilvk.ru/captcha").is_err());
+        assert!(validated_captcha_url("https://vk.ru.evil.example/captcha").is_err());
+        assert!(validated_captcha_url("https://id.vk.ru:8443/captcha").is_err());
+        assert!(validated_captcha_url("not a url").is_err());
     }
 }

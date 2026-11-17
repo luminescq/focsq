@@ -1,8 +1,11 @@
-﻿// SPDX-FileCopyrightText: 2026 luminescq
+// SPDX-FileCopyrightText: 2026 luminescq
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
+
+import '../l10n/app_locale.dart';
+import '../l10n/core_line_localizer.dart';
 
 import 'package:flutter/foundation.dart';
 
@@ -35,24 +38,27 @@ class LogService extends ChangeNotifier {
     developerMode = value;
     if (instance._lines.isEmpty) return;
     instance.clear();
-    instance.add(
-      value
-          ? '── Режим разработчика: полные логи ──'
-          : '── Обычный режим логов ──',
-    );
+    instance.add(value ? S.devModeLogsOn : S.normalLogsOn);
   }
 
   static bool isErrorLine(String line) {
     final lower = line.toLowerCase();
+    // «Превышен лимит сессии капчи» — штатная пауза, а не ошибка.
+    final limit =
+        lower.contains('лимит') && !lower.contains('лимит сессии капчи');
     return lower.contains('ошибка') ||
         lower.contains('error') ||
         lower.contains('фатал') ||
         lower.contains('fatal') ||
         lower.contains('failed') ||
         lower.contains('refused') ||
+        lower.contains('denied') ||
         lower.contains('timeout') ||
         lower.contains('не удалась') ||
         lower.contains('недоступен') ||
+        limit ||
+        lower.contains('огранич') ||
+        lower.contains('отказ') ||
         lower.contains('✗');
   }
 
@@ -74,19 +80,26 @@ class LogService extends ChangeNotifier {
   }
 
   static String? _resolveKey(String body) {
-    if (body.startsWith('[ВОРКЕР] Поток готов')) return 'worker_ready';
-    if (body.startsWith('[СЕТЬ]')) return 'network_stats';
+    if (body.startsWith('[WORKER]') || body.startsWith('[ВОРКЕР]')) {
+      return 'worker_ready';
+    }
+    if (body.startsWith('[NET]') || body.startsWith('[СЕТЬ]')) {
+      return 'network_stats';
+    }
     if (body.startsWith('[TURN]')) {
       if (body.contains('CreatePermission')) return 'turn_permission';
       if (body.contains('ChannelBind')) return 'turn_channel';
-      if (body.contains('Сессия готова') || body.contains('готова к передаче')) {
+      if (body.contains('Сессия готова') ||
+          body.contains('готова к передаче')) {
         return 'turn_ready';
       }
       if (body.contains('Refresh аллокации')) return 'turn_refresh';
       if (body.contains('Аллокация активна')) return 'turn_alloc';
     }
     if (body.startsWith('[КАПЧА]')) {
-      if (body.contains('Решение') || body.contains('решается')) {
+      if (body.contains('Решение') ||
+          body.contains('решается') ||
+          body.contains('Solving')) {
         return 'captcha_progress';
       }
     }
@@ -96,16 +109,26 @@ class LogService extends ChangeNotifier {
       if (body.contains('Креды получены')) return 'vk_creds';
     }
     if (body.startsWith('[TUN]')) {
-      if (body.contains('Конфиг сети получен')) return 'tun_config';
-      if (body.contains('Сетевой адаптер настроен')) return 'tun_adapter_ready';
-      if (body.contains('Маршрутизация и DNS')) return 'tun_routes_ready';
+      if (body.contains('Конфиг сети получен') ||
+          body.contains('Network config received')) {
+        return 'tun_config';
+      }
+      if (body.contains('Сетевой адаптер настроен') ||
+          body.contains('adapter configured')) {
+        return 'tun_adapter_ready';
+      }
+      if (body.contains('Маршрутизация и DNS') ||
+          body.contains('Routes and DNS')) {
+        return 'tun_routes_ready';
+      }
     }
     return null;
   }
 
   int _findLineByKey(String key) {
-    final start =
-        _lines.length > _keyedScanWindow ? _lines.length - _keyedScanWindow : 0;
+    final start = _lines.length > _keyedScanWindow
+        ? _lines.length - _keyedScanWindow
+        : 0;
     for (var i = _lines.length - 1; i >= start; i--) {
       final body = _extractBody(_lines[i]);
       if (_resolveKey(body) == key) {
@@ -138,7 +161,9 @@ class LogService extends ChangeNotifier {
       if (index != -1) {
         final existing = _lines[index];
         final currentCount = _extractCount(existing) + 1;
-        if (key == 'worker_ready' || key.startsWith('turn_') || key == 'vk_auth') {
+        if (key == 'worker_ready' ||
+            key.startsWith('turn_') ||
+            key == 'vk_auth') {
           _lines[index] = '[${_timestamp()}] $visible (x$currentCount)';
         } else {
           _lines[index] = stamped;
@@ -152,8 +177,7 @@ class LogService extends ChangeNotifier {
     final lastBody = _extractBody(last);
     if (lastBody == visible) {
       final currentCount = _extractCount(last) + 1;
-      _lines[_lines.length - 1] =
-          '[${_timestamp()}] $visible (x$currentCount)';
+      _lines[_lines.length - 1] = '[${_timestamp()}] $visible (x$currentCount)';
       _trimAndNotify();
       return;
     }
@@ -176,7 +200,20 @@ class LogService extends ChangeNotifier {
     return '${two(now.hour)}:${two(now.minute)}:${two(now.second)}';
   }
 
+  /// Видимость строки решает старая логика фильтра — она не зависит от языка.
+  /// Локализатор ядра вызывается уже ПОСЛЕ неё и переводит только то, что
+  /// и так должно попасть в журнал.
   static String? _userLine(String line) {
+    final legacy = _legacyUserLine(line);
+    if (legacy == null) return null;
+    if (LocaleService.isEnglish) {
+      final localized = CoreLineLocalizer.localize(line.trim());
+      if (localized != null) return localized;
+    }
+    return legacy;
+  }
+
+  static String? _legacyUserLine(String line) {
     final trimmed = line.trim();
 
     if (trimmed.startsWith('__CSQTT_EVENT__|')) {
@@ -187,7 +224,7 @@ class LogService extends ChangeNotifier {
       final jsonStr = payload.substring(pipe + 1);
 
       if (type == 'READY') {
-        return '[ВОРКЕР] Поток готов ✓';
+        return S.workerReadyLine;
       }
       if (type == 'STATS') {
         try {
@@ -195,8 +232,15 @@ class LogService extends ChangeNotifier {
           final active = (map['active'] as num?)?.toInt() ?? 0;
           final up = (map['bytes_up'] as num?)?.toInt() ?? 0;
           final down = (map['bytes_down'] as num?)?.toInt() ?? 0;
-          final totalMb = (up + down) / (1024.0 * 1024.0);
-          return '[СЕТЬ] Активных потоков: $active | Трафик: ${totalMb.toStringAsFixed(2)} МБ';
+          // [FOCSQ] ↑/↓ раздельно: сумма не показывает, какое направление
+          // не течёт (аплинк в TURN или даунлинк из аллокаций).
+          final upMb = up / (1024.0 * 1024.0);
+          final downMb = down / (1024.0 * 1024.0);
+          return S.networkStatsLine(
+            active,
+            upMb.toStringAsFixed(2),
+            downMb.toStringAsFixed(2),
+          );
         } catch (_) {
           return null;
         }
@@ -213,20 +257,20 @@ class LogService extends ChangeNotifier {
             final parts = conf.split(':');
             final ip = parts.isNotEmpty ? parts[0] : '';
             final dns = parts.length > 1 ? parts[1] : '';
-            return '[TUN] Конфиг сети получен: $ip (DNS: $dns)';
+            return S.tunConfig(ip, dns);
           }
         } catch (_) {}
         return null;
       }
       if (type == 'SERVER_RESTART') {
-        return '[СЕРВЕР] Сервер перезапущен панелью';
+        return S.serverRestartedByPanel;
       }
       return null;
     }
 
     if (trimmed.startsWith('CAPTCHA_SOLVE|')) return null;
 
-    if (trimmed.contains('FATAL_AUTH') ||
+    if (trimmed.contains('FATAL') ||
         trimmed.contains('[ФАТАЛ]') ||
         trimmed.contains('[ОШИБКА]') ||
         trimmed.contains('невосстановимая') ||
@@ -237,24 +281,25 @@ class LogService extends ChangeNotifier {
 
     if (trimmed.contains('Exclude-маршрут') ||
         trimmed.contains('Exclude-подсеть') ||
-        (trimmed.startsWith('[TUN]') && trimmed.contains('перехвата ещё нет'))) {
+        (trimmed.startsWith('[TUN]') &&
+            trimmed.contains('перехвата ещё нет'))) {
       return null;
     }
     if (trimmed.contains('Wintun-адаптер создан') ||
         trimmed.contains('wintun-адаптер создан') ||
         trimmed.contains('Wintun создан')) {
-      return '[TUN] Wintun-адаптер создан ✓';
+      return S.wintunCreatedLine;
     }
     if (trimmed.contains('TUN-адаптер настроен') ||
         trimmed.contains('адаптер настроен')) {
-      return '[TUN] Сетевой адаптер настроен (IP/DNS/маршруты) ✓';
+      return S.tunAdapterReadyLine;
     }
     if (trimmed.startsWith('[КЛИЕНТ] Tunnel IP:')) {
       final text = trimmed.substring('[КЛИЕНТ]'.length).trim();
       return '[TUN] $text';
     }
     if (trimmed.startsWith('[TUN] Настроен:')) {
-      return '[TUN] Маршрутизация и DNS применены ✓';
+      return S.tunRoutesReadyLine;
     }
     if (trimmed.startsWith('[TUN]')) {
       return trimmed;
@@ -299,21 +344,21 @@ class LogService extends ChangeNotifier {
     }
     if (trimmed.contains('Success via VK Calls') ||
         trimmed.contains('[VKCalls] SUCCESS')) {
-      return '[ЗВОНКИ] Авторизация VK пройдена ✓';
+      return S.vkAuthPassedLine;
     }
     if (trimmed.contains('Звонки не прошли')) {
       final separator = trimmed.indexOf('·');
       final tail = separator > 0 ? trimmed.substring(separator) : '';
-      return '[ЗВОНКИ] Звонки не прошли $tail'.trim();
+      return S.callsFailedLine(tail);
     }
 
     if (trimmed.startsWith('[КАПЧА]')) {
       final clean = trimmed.replaceAll(RegExp(r'\s*\([^)]*\)'), '').trim();
       if (clean.contains('Smart Captcha решена') || clean.contains('решена')) {
-        return '[КАПЧА] Капча успешно решена ✓';
+        return S.captchaSolvedLine;
       }
       if (clean.contains('Решаю') || clean.contains('старт')) {
-        return '[КАПЧА] Решение капчи...';
+        return S.captchaSolvingLine;
       }
       return clean;
     }
@@ -326,14 +371,25 @@ class LogService extends ChangeNotifier {
     }
 
     const keepPrefixes = [
+      '[CONNECT]',
+      '[CORE]',
+      '[WINDOW]',
+      '[STATUS]',
+      '[TRAY]',
+      '[VK]',
+      '[AUTOSTART]',
+      '[SERVICE]',
+      '[AUTO API]',
+      '[CALLS]',
+      // Русские варианты оставлены для сырых строк ядра и совместимости.
       '[КОННЕКТ]',
       '[ЯДРО]',
       '[ОКНО]',
-      '[Туннель]',
       '[СТАТУС]',
       '[ТРЕЙ]',
       '[ВК]',
       '[АВТОСТАРТ]',
+      '[Туннель]',
     ];
     for (final prefix in keepPrefixes) {
       if (trimmed.startsWith(prefix)) return trimmed;
@@ -343,7 +399,7 @@ class LogService extends ChangeNotifier {
       if (isErrorLine(trimmed)) {
         return trimmed;
       }
-      return '[ВОРКЕР] Поток готов ✓';
+      return S.workerReadyLine;
     }
 
     return null;

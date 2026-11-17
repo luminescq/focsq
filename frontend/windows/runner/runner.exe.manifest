@@ -1,11 +1,13 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <!-- [FOCSQ] TUN requires administrator privileges (wintun adapter):
-       request elevation at launch, same as PWDTT. -->
+  <!-- [FOCSQ] asInvoker: любой второй запуск (ярлык, пин, exe) стартует
+       без UAC и уходит в ActivateExistingInstance. Повышение происходит
+       один раз в main.cpp через runas, когда мьютекс подтвердил, что мы
+       первый экземпляр. TUN (wintun) и маршруты требуют админа. -->
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
     <security>
       <requestedPrivileges xmlns="urn:schemas-microsoft-com:asm.v3">
-        <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
       </requestedPrivileges>
     </security>
   </trustInfo>

@@ -1,6 +1,7 @@
 ﻿// SPDX-FileCopyrightText: 2026 luminescq
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 import 'dart:io';
+import '../l10n/app_locale.dart';
 import 'logs.dart';
 
 class UrlService {
@@ -11,10 +12,10 @@ class UrlService {
     if (uri == null ||
         (uri.scheme != 'http' && uri.scheme != 'https') ||
         uri.host.isEmpty) {
-      throw FormatException('только http/https с указанным хостом: $url');
+      throw FormatException(S.browserOnlyHttp(url));
     }
     if (!_isPublicHost(uri.host)) {
-      throw FormatException('приватный/зарезервированный хост: $url');
+      throw FormatException(S.browserPrivateHost(url));
     }
     return url;
   }
@@ -28,10 +29,10 @@ class UrlService {
       if (Platform.isLinux) {
         return _run(['xdg-open', safe]);
       }
-      LogService().add('[СЕРВИС] Открытие браузера на этой ОС не поддержано');
+      LogService().add(S.browserUnsupportedLog);
       return Future.value(false);
     } on FormatException catch (error) {
-      LogService().add('[СЕРВИС] Ссылка отклонена: ${error.message}');
+      LogService().add(S.browserRejectedLog(error.message));
       return Future.value(false);
     }
   }
@@ -41,7 +42,7 @@ class UrlService {
       final result = await Process.run(command.first, command.sublist(1));
       return result.exitCode == 0;
     } catch (error) {
-      LogService().add('[СЕРВИС] Браузер не открылся: $error');
+      LogService().add(S.browserOpenFailedLog(error));
       return false;
     }
   }

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-FileCopyrightText: 2026 amurcanov -->
+<!-- SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0 -->
+
+<resources>
+    <!-- Google Pixel / Material You Dynamic Colors - API 31+ Dark Theme -->
+    <color name="widget_card_background">@android:color/system_neutral1_900</color>
+    <color name="widget_card_stroke">@android:color/system_neutral1_800</color>
+    <color name="widget_button_bg_active">@android:color/system_accent1_200</color>
+    <color name="widget_button_bg_inactive">@android:color/system_neutral1_800</color>
+    <color name="widget_button_stroke_active">@android:color/system_accent1_100</color>
+    <color name="widget_button_stroke_inactive">@android:color/system_neutral1_700</color>
+</resources>

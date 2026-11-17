@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-FileCopyrightText: 2026 amurcanov -->
+<!-- SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0 -->
+
+<resources>
+    <color name="tv_banner_background">#101927</color>
+    <color name="app_background">#F2F2F2</color>
+
+    <!-- Google Pixel / Material You Widget Styling - Light Theme fallbacks -->
+    <color name="widget_text_primary">#0A0A0A</color>
+    <color name="widget_text_secondary">#666666</color>
+    <color name="widget_status_connected">#1F8A5B</color>
+    <color name="widget_card_background">#FFFFFF</color>
+    <color name="widget_card_stroke">#D9D9D9</color>
+    <color name="widget_button_bg_active">#5B9DF7</color>
+    <color name="widget_button_bg_inactive">#EDEDED</color>
+    <color name="widget_button_stroke_active">#5B9DF7</color>
+    <color name="widget_button_stroke_inactive">#D9D9D9</color>
+</resources>

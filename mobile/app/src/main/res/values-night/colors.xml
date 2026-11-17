@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-FileCopyrightText: 2026 amurcanov -->
+<!-- SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0 -->
+
+<resources>
+    <color name="app_background">#0A0A0A</color>
+
+    <!-- Google Pixel / Material You Widget Styling - Dark Theme -->
+    <color name="widget_text_primary">#F2F2F2</color>
+    <color name="widget_text_secondary">#9A9DA3</color>
+    <color name="widget_status_connected">#4CC38A</color>
+    <color name="widget_card_background">#1C1C1C</color>
+    <color name="widget_card_stroke">#262626</color>
+    <color name="widget_button_bg_active">#D9D9D9</color>
+    <color name="widget_button_bg_inactive">#252525</color>
+    <color name="widget_button_stroke_active">#D9D9D9</color>
+    <color name="widget_button_stroke_inactive">#262626</color>
+</resources>

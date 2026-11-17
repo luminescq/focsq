@@ -3,8 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/service/vk/auto_calls.dart';
 
 /// Математика режима «Авто API»: сколько звонков нужно под число воркеров.
-/// Формула из оригинала (VkAutoCallsManager.kt): n звонков покрывают
-/// n * 3 групп * 9 воркеров, n от 1 до 6.
+/// Схема 2.5.0: n звонков покрывают n * 1 группу * 10 воркеров, n от 1 до 6.
 void main() {
   group('VkAutoCallsManager.callCountForWorkers', () {
     test('ноль и один воркер — один звонок', () {
@@ -12,23 +11,23 @@ void main() {
       expect(VkAutoCallsManager.callCountForWorkers(1), 1);
     });
 
-    test('границы диапазонов: 27, 54, 81, 108, 135, 162', () {
-      expect(VkAutoCallsManager.callCountForWorkers(27), 1);
-      expect(VkAutoCallsManager.callCountForWorkers(54), 2);
-      expect(VkAutoCallsManager.callCountForWorkers(81), 3);
-      expect(VkAutoCallsManager.callCountForWorkers(108), 4);
-      expect(VkAutoCallsManager.callCountForWorkers(135), 5);
-      expect(VkAutoCallsManager.callCountForWorkers(162), 6);
+    test('границы диапазонов: 10, 20, 30, 40, 50, 60', () {
+      expect(VkAutoCallsManager.callCountForWorkers(10), 1);
+      expect(VkAutoCallsManager.callCountForWorkers(20), 2);
+      expect(VkAutoCallsManager.callCountForWorkers(30), 3);
+      expect(VkAutoCallsManager.callCountForWorkers(40), 4);
+      expect(VkAutoCallsManager.callCountForWorkers(50), 5);
+      expect(VkAutoCallsManager.callCountForWorkers(60), 6);
     });
 
     test('внутри диапазона округляет вверх до нужного числа звонков', () {
-      expect(VkAutoCallsManager.callCountForWorkers(28), 2);
-      expect(VkAutoCallsManager.callCountForWorkers(55), 3);
-      expect(VkAutoCallsManager.callCountForWorkers(100), 4);
+      expect(VkAutoCallsManager.callCountForWorkers(11), 2);
+      expect(VkAutoCallsManager.callCountForWorkers(21), 3);
+      expect(VkAutoCallsManager.callCountForWorkers(100), 6);
     });
 
     test('сверх максимума — потолок в 6 звонков', () {
-      expect(VkAutoCallsManager.callCountForWorkers(163), 6);
+      expect(VkAutoCallsManager.callCountForWorkers(61), 6);
       expect(VkAutoCallsManager.callCountForWorkers(1000), 6);
     });
 

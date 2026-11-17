@@ -1,7 +1,9 @@
-﻿// SPDX-FileCopyrightText: 2026 luminescq
+// SPDX-FileCopyrightText: 2026 luminescq
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 import 'dart:async';
 import 'dart:convert';
+
+import '../l10n/app_locale.dart';
 import 'dart:ffi' as ffi;
 import 'dart:io';
 import 'dart:math';
@@ -16,6 +18,7 @@ import 'db.dart';
 import 'import.dart';
 import 'logs.dart';
 import 'tun_rights.dart';
+import 'worker_limits.dart';
 import 'vk/auto_calls.dart';
 import 'vk/token.dart';
 
@@ -70,16 +73,24 @@ class ConnectService extends ChangeNotifier {
       _connectWatchdog?.cancel();
       _connectWatchdog = null;
     }
+    // [FOCSQ] Watchdog «Отключение…»: ядро может не дойти до STOPPED
+    // (зависшая финализация/задача) — без таймера UI залипал навсегда.
+    if (value != ConnectState.disconnecting) {
+      _disconnectWatchdog?.cancel();
+      _disconnectWatchdog = null;
+    } else {
+      _armDisconnectWatchdog();
+    }
     switch (value) {
       case ConnectState.connecting:
-        _log('[СТАТУС] Подключение...');
+        _log(S.logConnecting);
       case ConnectState.connected:
-        _log('[СТАТУС] Подключено · потоков ${_stats.activeWorkers}');
+        _log(S.logConnected(_stats.activeWorkers));
       case ConnectState.disconnecting:
-        _log('[СТАТУС] Отключение...');
+        _log(S.logDisconnecting);
       case ConnectState.disconnected:
         if (previous != ConnectState.disconnected) {
-          _log('[СТАТУС] Отключено');
+          _log(S.logDisconnected);
         }
     }
     notifyListeners();
@@ -87,6 +98,28 @@ class ConnectService extends ChangeNotifier {
 
   Timer? _connectWatchdog;
   static const Duration _connectWatchdogTimeout = Duration(seconds: 60);
+
+  Timer? _disconnectWatchdog;
+  static const Duration _disconnectWatchdogTimeout = Duration(seconds: 30);
+
+  void _armDisconnectWatchdog() {
+    _disconnectWatchdog?.cancel();
+    _disconnectWatchdog = Timer(
+      _disconnectWatchdogTimeout,
+      _onDisconnectTimeout,
+    );
+  }
+
+  Future<void> _onDisconnectTimeout() async {
+    if (_state != ConnectState.disconnecting) return;
+    _disconnectWatchdog = null;
+    _log(S.logCoreNoStop(_disconnectWatchdogTimeout.inSeconds));
+    _coreRun = null;
+    _clientRunning = false;
+    _tunReady = false;
+    _stats = const ConnectStats();
+    _setState(ConnectState.disconnected);
+  }
 
   void _restartConnectWatchdog() {
     if (_state != ConnectState.connecting) return;
@@ -97,16 +130,13 @@ class ConnectService extends ChangeNotifier {
   Future<void> _onConnectTimeout() async {
     if (_state != ConnectState.connecting) return;
     _connectWatchdog = null;
-    _lastError =
-        'Не удалось подключиться за '
-        '${_connectWatchdogTimeout.inSeconds} с — проверьте интернет '
-        'или отключите другой VPN';
-    _log('[КОННЕКТ] ${_lastError!}');
+    _lastError = S.connectWatchdog(_connectWatchdogTimeout.inSeconds);
+    _log('[CONNECT] ${_lastError!}');
 
     await stop();
     await waitForExit();
     if (_state != ConnectState.disconnected) {
-      _log('[КОННЕКТ] Ядро не ответило на отмену — состояние сброшено');
+      _log(S.logCoreNoCancel);
       _coreRun = null;
       _clientRunning = false;
       _setState(ConnectState.disconnected);
@@ -153,11 +183,11 @@ class ConnectService extends ChangeNotifier {
       await RustLib.init();
       _coreLogSub = rust.setupLogStream().listen(
         onCoreLine,
-        onError: (Object error) => _log('[ЯДРО] Ошибка потока логов: $error'),
-        onDone: () => _log('[ЯДРО] Поток логов закрыт'),
+        onError: (Object error) => _log(S.logLogStreamError(error)),
+        onDone: () => _log(S.logLogStreamClosed),
       );
       _rustReady = true;
-      _log('[ЯДРО] Мост инициализирован');
+      _log(S.logBridgeReady);
     } on Object catch (e) {
       throw Exception(_cleanError(e));
     }
@@ -167,7 +197,7 @@ class ConnectService extends ChangeNotifier {
     final error = await (_state == ConnectState.disconnected
         ? start()
         : stop());
-    if (error != null) _log('[КОННЕКТ] $error');
+    if (error != null) _log('[CONNECT] $error');
     return error;
   }
 
@@ -178,46 +208,49 @@ class ConnectService extends ChangeNotifier {
 
     _lastError = null;
     _tunReady = false;
+    // Поколение запуска: stop()/watchdog инкрементируют счётчик, и незрелый
+    // _startInternal после каждого await понимает, что его отменили.
+    final attempt = ++_startAttempt;
     _setState(ConnectState.connecting);
     _restartConnectWatchdog();
 
     try {
-      final error = await _startInternal();
+      final error = await _startInternal(attempt);
       if (error != null) {
         _setState(ConnectState.disconnected);
       }
       return error;
     } catch (e) {
       _setState(ConnectState.disconnected);
-      final msg = 'Ошибка запуска: $e';
-      _log('[КОННЕКТ] $msg');
+      final msg = S.errStartFailed(e);
+      _log('[CONNECT] $msg');
       return msg;
     }
   }
 
-  Future<String?> _startInternal() async {
+  Future<String?> _startInternal(int attempt) async {
     await _ensureRust();
+    if (attempt != _startAttempt) return null;
 
     final settings = await DbService.getSettings();
     final profile = await DbService.getActiveProfile(settings);
     if (profile == null) {
-      return 'Сначала добавьте и выберите профиль сервера';
+      return S.errNoProfile;
     }
 
     final ip = profile.ip?.trim() ?? '';
     final port = profile.port;
     final password = profile.password?.trim() ?? '';
     if (ip.isEmpty || !ImportService.isValidPort(port)) {
-      return 'В профиле «${profile.name}» не заполнены адрес или порт';
+      return S.errProfileIncomplete(profile.name);
     }
     if (password.isEmpty) {
-      return 'В профиле «${profile.name}» не указан пароль';
+      return S.errNoPassword(profile.name);
     }
 
     if (Platform.isWindows) {
       if (!_isAdmin()) {
-        return 'Запустите приложение от имени администратора '
-            '(нужны права на создание TUN-адаптера)';
+        return S.errAdminRequired;
       }
     } else if (Platform.isLinux) {
       final issue = await TunRights.ensureForConnect();
@@ -226,6 +259,7 @@ class ConnectService extends ChangeNotifier {
         return issue;
       }
     }
+    if (attempt != _startAttempt) return null;
 
     var hashMode = switch (settings.hashes) {
       'Авто ВК' => 'auto_js',
@@ -248,38 +282,37 @@ class ConnectService extends ChangeNotifier {
         authMode == 'auto_js') {
       final vk = await VkToken.readWithStatus();
       if (vk.issue != null) {
-        return 'Токен ВК недоступен: ${vk.issue}';
+        return S.errVkTokenIssue(vk.issue!);
       }
       vkToken = vk.token;
       if (vkToken == null || vkToken.isEmpty) {
-        return 'Требуется вход ВКонтакте (Настройки → Аккаунт ВКонтакте)';
+        return S.errVkLoginRequired;
       }
     }
 
     var vkValue = settings.customHashes.trim();
     var allowRedistribution = false;
     if (hashMode == 'manual' && vkValue.isEmpty) {
-      return 'Для ручного режима заполните хеши (Настройки → Хеши)';
+      return S.errManualHashesRequired;
     }
 
     VkAutoCallsManager? manager;
     if (hashMode == 'auto_api') {
       manager = VkAutoCallsManager();
-      final workers = _normalizeWorkers(profile.power);
+      final workers = WorkerLimits.normalizeCount(profile.power);
       final batch = await manager.createForWorkers(
         token: vkToken!,
         workers: workers,
-        onProgress: (created, total) =>
-            _log('[АВТО API] Звонок создан: $created/$total'),
+        onProgress: (created, total) => _log(S.logCallCreated(created, total)),
       );
       if (batch == null) {
         manager.close();
 
         if (manager.tokenInvalidSeen) {
           await VkToken.delete();
-          return 'Токен ВК недействителен — выполните вход заново';
+          return S.errVkTokenInvalid;
         }
-        return 'Не удалось создать звонки VK — проверь интернет и попробуй ещё раз';
+        return S.errVkCallsCreateFailed;
       }
       vkValue = batch.hashes.join(',');
       allowRedistribution = batch.needsWorkerRedistribution;
@@ -290,7 +323,13 @@ class ConnectService extends ChangeNotifier {
       _callsManager = manager;
     }
 
-    final workers = _normalizeWorkers(profile.power);
+    // Долгий await (создание звонков) мог быть отменён stop()/watchdog.
+    if (attempt != _startAttempt) {
+      await _finishAutoApiCalls();
+      return null;
+    }
+
+    final workers = _workersForProfile(profile.power, hashMode, vkValue);
     final config = rust.AppClientConfig(
       turn: '',
       port: '',
@@ -314,10 +353,25 @@ class ConnectService extends ChangeNotifier {
       tunUds: _tunMode,
       validateVkHashes: false,
       vkJsToken: vkToken ?? '',
+      domainRouting: settings.zDomainRouting,
+      excludeRuZones: settings.zExcludeRuZones,
+      templateDomains: settings.zTemplateDomains,
+      domainWhitelist: settings.zDomainWhitelist,
+      directDomains: settings.zDirectDomains,
+      ipRouting: settings.zIpRouting,
+      ipWhitelist: settings.zIpWhitelist,
+      directIps: settings.zDirectIps,
     );
 
     if (Platform.isWindows) {
       await _ensureWintunDll();
+    }
+
+    // Последний барьер: без него stop() во время долгого await запустил бы
+    // ядро, когда UI уже показал «Отключено».
+    if (attempt != _startAttempt) {
+      await _finishAutoApiCalls();
+      return null;
     }
 
     _clientRunning = true;
@@ -330,7 +384,17 @@ class ConnectService extends ChangeNotifier {
   }
 
   Future<String?> stop() async {
-    if (_coreRun == null) return null;
+    if (_coreRun == null) {
+      // Ядро ещё не запущено, но start() может висеть в ожидании (Авто API,
+      // pkexec) — отменяем поколение запуска и возвращаем UI в исходное.
+      if (_state == ConnectState.connecting) {
+        _startAttempt++;
+        _connectWatchdog?.cancel();
+        _connectWatchdog = null;
+        _setState(ConnectState.disconnected);
+      }
+      return null;
+    }
     _setState(ConnectState.disconnecting);
     try {
       await rust.stopCsqttClient();
@@ -358,13 +422,13 @@ class ConnectService extends ChangeNotifier {
     _tunReady = false;
     _stats = const ConnectStats();
 
-    CaptchaService.abort('клиент остановлен');
+    CaptchaService.abort(S.clientStoppedReason);
 
     if (error != null) {
       _lastError = _cleanError(error);
-      _log('[ЯДРО] ${_lastError!}');
+      _log('[CORE] ${_lastError!}');
     } else {
-      _log('[ЯДРО] Ядро остановлено');
+      _log(S.logCoreStopped);
     }
 
     await _finishAutoApiCalls();
@@ -380,7 +444,7 @@ class ConnectService extends ChangeNotifier {
     _callsManager = null;
     if (ids.isEmpty || token == null || manager == null) return;
 
-    _log('[АВТО API] Завершаю звонки (${ids.length})...');
+    _log(S.logFinishingCalls(ids.length));
     await manager.finishAll(token, ids);
     manager.close();
   }
@@ -439,9 +503,9 @@ class ConnectService extends ChangeNotifier {
         final code = (payload['code'] as num?)?.toInt() ?? 0;
         final message = payload['message']?.toString() ?? '';
         final fatal = payload['fatal'] == true;
-        _log('[ЯДРО] ${fatal ? 'ФАТАЛЬНО' : 'Ошибка'} ($code) $message');
+        _log(S.logCoreError(fatal, code, message));
         if (fatal) {
-          _lastError = message.isEmpty ? 'Ошибка ядра' : message;
+          _lastError = message.isEmpty ? S.errCoreGeneric : message;
           _clientRunning = false;
           _setState(ConnectState.disconnected);
         }
@@ -462,7 +526,7 @@ class ConnectService extends ChangeNotifier {
           final parts = conf.split(':');
           final ip = parts.isNotEmpty ? parts[0] : '';
           final dns = parts.length > 1 ? parts[1] : '';
-          _log('[TUN] Конфиг сети получен: $ip (DNS: $dns)');
+          _log(S.tunConfig(ip, dns));
           _tunReady = true;
           if (_clientRunning &&
               _stats.activeWorkers > 0 &&
@@ -472,7 +536,13 @@ class ConnectService extends ChangeNotifier {
         }
 
       case 'SERVER_RESTART':
-        _log('[ЯДРО] Сервер перезапущен панелью');
+        _log(S.logServerRestart);
+
+      case 'CALL_UNAVAILABLE':
+        // Ядро дедуплицирует по хешу, поэтому каждая строка — новый дохлый хеш.
+        // Сам хеш не выводим: это идентификатор звонка, не для логов.
+        final code = (payload['code'] as num?)?.toInt() ?? 0;
+        _log(S.callUnavailableLine(code));
 
       case 'READY':
       case 'STARTED':
@@ -510,18 +580,39 @@ class ConnectService extends ChangeNotifier {
       if (!await target.exists()) {
         final data = await rootBundle.load('assets/wintun.dll');
         await target.writeAsBytes(data.buffer.asUint8List(), flush: true);
-        _log('[TUN] wintun.dll распакован: ${target.path}');
+        _log('${S.wintunExtracted}${target.path}');
       }
 
       rust.setWintunDllPath(path: target.path);
     } catch (error) {
-      _log('[TUN] Не удалось распаковать wintun.dll: $error');
+      _log(S.wintunExtractFailed(error));
     }
   }
 
-  int _normalizeWorkers(int? requested) => requested ?? 9;
+  /// Число потоков, которое реально примет ядро: кратно 10, не больше 100.
+  /// В ручном режиме число хешей больше не ограничивает максимум: ядро 2.5.0
+  /// добавляет credential-когорты на тот же хеш.
+  int _workersForProfile(int? requested, String hashMode, String vkValue) {
+    var workers = WorkerLimits.normalizeCount(requested);
+    if (hashMode != 'manual') return workers;
+
+    final hashCount = vkValue
+        .split(',')
+        .where((hash) => hash.trim().isNotEmpty)
+        .length;
+    final maxByHashes = WorkerLimits.maxForHashes(hashCount);
+    if (workers > maxByHashes) {
+      _log(S.logWorkersCapped(workers, maxByHashes));
+      workers = maxByHashes;
+    }
+    return workers;
+  }
 
   int _lastGeneration = 0;
+
+  /// Счётчик попыток запуска: растёт на каждый start() и на каждую отмену
+  /// (stop()/watchdog), чтобы незрелый _startInternal прекращался сам.
+  int _startAttempt = 0;
 
   int _nextGeneration() {
     final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;

@@ -55,25 +55,13 @@ void main() {
     test('нормализация "v1.2.3" даёт "1.2.3" в результатах', () {
       // Проверяем через статусы: кэш версии хранит нормализованный тег.
       // Прямая проверка: UpdateAvailable.version приходит из tag_name.
-      expect(
-        'v1.2.3'.replaceFirst(RegExp('^v'), ''),
-        '1.2.3',
-      );
-      expect(
-        'v10.20.30'.replaceFirst(RegExp('^v'), ''),
-        '10.20.30',
-      );
+      expect('v1.2.3'.replaceFirst(RegExp('^v'), ''), '1.2.3');
+      expect('v10.20.30'.replaceFirst(RegExp('^v'), ''), '10.20.30');
     });
   });
 
   test('releasesPage указывает на GitHub-репозиторий проекта', () {
-    expect(
-      UpdateService.releasesPage,
-      contains('github.com/luminescq/focsq'),
-    );
-    expect(
-      UpdateService.releasesPage,
-      startsWith('https://'),
-    );
+    expect(UpdateService.releasesPage, contains('github.com/luminescq/focsq'));
+    expect(UpdateService.releasesPage, startsWith('https://'));
   });
 }

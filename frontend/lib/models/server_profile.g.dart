@@ -26,6 +26,17 @@ const ServerProfileSchema = CollectionSchema(
     ),
     r'port': PropertySchema(id: 3, name: r'port', type: IsarType.long),
     r'power': PropertySchema(id: 4, name: r'power', type: IsarType.long),
+    r'subUuid': PropertySchema(id: 5, name: r'subUuid', type: IsarType.string),
+    r'subscriptionUrl': PropertySchema(
+      id: 6,
+      name: r'subscriptionUrl',
+      type: IsarType.string,
+    ),
+    r'threadsLimit': PropertySchema(
+      id: 7,
+      name: r'threadsLimit',
+      type: IsarType.long,
+    ),
   },
   estimateSize: _serverProfileEstimateSize,
   serialize: _serverProfileSerialize,
@@ -65,6 +76,18 @@ int _serverProfileEstimateSize(
       bytesCount += 3 + value.length * 3;
     }
   }
+  {
+    final value = object.subUuid;
+    if (value != null) {
+      bytesCount += 3 + value.length * 3;
+    }
+  }
+  {
+    final value = object.subscriptionUrl;
+    if (value != null) {
+      bytesCount += 3 + value.length * 3;
+    }
+  }
   return bytesCount;
 }
 
@@ -79,6 +102,9 @@ void _serverProfileSerialize(
   writer.writeString(offsets[2], object.password);
   writer.writeLong(offsets[3], object.port);
   writer.writeLong(offsets[4], object.power);
+  writer.writeString(offsets[5], object.subUuid);
+  writer.writeString(offsets[6], object.subscriptionUrl);
+  writer.writeLong(offsets[7], object.threadsLimit);
 }
 
 ServerProfile _serverProfileDeserialize(
@@ -94,6 +120,9 @@ ServerProfile _serverProfileDeserialize(
     password: reader.readStringOrNull(offsets[2]),
     port: reader.readLongOrNull(offsets[3]),
     power: reader.readLongOrNull(offsets[4]),
+    subUuid: reader.readStringOrNull(offsets[5]),
+    subscriptionUrl: reader.readStringOrNull(offsets[6]),
+    threadsLimit: reader.readLongOrNull(offsets[7]),
   );
   return object;
 }
@@ -114,6 +143,12 @@ P _serverProfileDeserializeProp<P>(
     case 3:
       return (reader.readLongOrNull(offset)) as P;
     case 4:
+      return (reader.readLongOrNull(offset)) as P;
+    case 5:
+      return (reader.readStringOrNull(offset)) as P;
+    case 6:
+      return (reader.readStringOrNull(offset)) as P;
+    case 7:
       return (reader.readLongOrNull(offset)) as P;
     default:
       throw IsarError('Unknown property with id $propertyId');
@@ -909,6 +944,397 @@ extension ServerProfileQueryFilter
       );
     });
   }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterFilterCondition>
+  subUuidIsNull() {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(
+        const FilterCondition.isNull(property: r'subUuid'),
+      );
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterFilterCondition>
+  subUuidIsNotNull() {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(
+        const FilterCondition.isNotNull(property: r'subUuid'),
+      );
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterFilterCondition>
+  subUuidEqualTo(String? value, {bool caseSensitive = true}) {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(
+        FilterCondition.equalTo(
+          property: r'subUuid',
+          value: value,
+          caseSensitive: caseSensitive,
+        ),
+      );
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterFilterCondition>
+  subUuidGreaterThan(
+    String? value, {
+    bool include = false,
+    bool caseSensitive = true,
+  }) {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(
+        FilterCondition.greaterThan(
+          include: include,
+          property: r'subUuid',
+          value: value,
+          caseSensitive: caseSensitive,
+        ),
+      );
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterFilterCondition>
+  subUuidLessThan(
+    String? value, {
+    bool include = false,
+    bool caseSensitive = true,
+  }) {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(
+        FilterCondition.lessThan(
+          include: include,
+          property: r'subUuid',
+          value: value,
+          caseSensitive: caseSensitive,
+        ),
+      );
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterFilterCondition>
+  subUuidBetween(
+    String? lower,
+    String? upper, {
+    bool includeLower = true,
+    bool includeUpper = true,
+    bool caseSensitive = true,
+  }) {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(
+        FilterCondition.between(
+          property: r'subUuid',
+          lower: lower,
+          includeLower: includeLower,
+          upper: upper,
+          includeUpper: includeUpper,
+          caseSensitive: caseSensitive,
+        ),
+      );
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterFilterCondition>
+  subUuidStartsWith(String value, {bool caseSensitive = true}) {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(
+        FilterCondition.startsWith(
+          property: r'subUuid',
+          value: value,
+          caseSensitive: caseSensitive,
+        ),
+      );
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterFilterCondition>
+  subUuidEndsWith(String value, {bool caseSensitive = true}) {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(
+        FilterCondition.endsWith(
+          property: r'subUuid',
+          value: value,
+          caseSensitive: caseSensitive,
+        ),
+      );
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterFilterCondition>
+  subUuidContains(String value, {bool caseSensitive = true}) {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(
+        FilterCondition.contains(
+          property: r'subUuid',
+          value: value,
+          caseSensitive: caseSensitive,
+        ),
+      );
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterFilterCondition>
+  subUuidMatches(String pattern, {bool caseSensitive = true}) {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(
+        FilterCondition.matches(
+          property: r'subUuid',
+          wildcard: pattern,
+          caseSensitive: caseSensitive,
+        ),
+      );
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterFilterCondition>
+  subUuidIsEmpty() {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(
+        FilterCondition.equalTo(property: r'subUuid', value: ''),
+      );
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterFilterCondition>
+  subUuidIsNotEmpty() {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(
+        FilterCondition.greaterThan(property: r'subUuid', value: ''),
+      );
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterFilterCondition>
+  subscriptionUrlIsNull() {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(
+        const FilterCondition.isNull(property: r'subscriptionUrl'),
+      );
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterFilterCondition>
+  subscriptionUrlIsNotNull() {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(
+        const FilterCondition.isNotNull(property: r'subscriptionUrl'),
+      );
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterFilterCondition>
+  subscriptionUrlEqualTo(String? value, {bool caseSensitive = true}) {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(
+        FilterCondition.equalTo(
+          property: r'subscriptionUrl',
+          value: value,
+          caseSensitive: caseSensitive,
+        ),
+      );
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterFilterCondition>
+  subscriptionUrlGreaterThan(
+    String? value, {
+    bool include = false,
+    bool caseSensitive = true,
+  }) {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(
+        FilterCondition.greaterThan(
+          include: include,
+          property: r'subscriptionUrl',
+          value: value,
+          caseSensitive: caseSensitive,
+        ),
+      );
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterFilterCondition>
+  subscriptionUrlLessThan(
+    String? value, {
+    bool include = false,
+    bool caseSensitive = true,
+  }) {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(
+        FilterCondition.lessThan(
+          include: include,
+          property: r'subscriptionUrl',
+          value: value,
+          caseSensitive: caseSensitive,
+        ),
+      );
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterFilterCondition>
+  subscriptionUrlBetween(
+    String? lower,
+    String? upper, {
+    bool includeLower = true,
+    bool includeUpper = true,
+    bool caseSensitive = true,
+  }) {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(
+        FilterCondition.between(
+          property: r'subscriptionUrl',
+          lower: lower,
+          includeLower: includeLower,
+          upper: upper,
+          includeUpper: includeUpper,
+          caseSensitive: caseSensitive,
+        ),
+      );
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterFilterCondition>
+  subscriptionUrlStartsWith(String value, {bool caseSensitive = true}) {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(
+        FilterCondition.startsWith(
+          property: r'subscriptionUrl',
+          value: value,
+          caseSensitive: caseSensitive,
+        ),
+      );
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterFilterCondition>
+  subscriptionUrlEndsWith(String value, {bool caseSensitive = true}) {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(
+        FilterCondition.endsWith(
+          property: r'subscriptionUrl',
+          value: value,
+          caseSensitive: caseSensitive,
+        ),
+      );
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterFilterCondition>
+  subscriptionUrlContains(String value, {bool caseSensitive = true}) {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(
+        FilterCondition.contains(
+          property: r'subscriptionUrl',
+          value: value,
+          caseSensitive: caseSensitive,
+        ),
+      );
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterFilterCondition>
+  subscriptionUrlMatches(String pattern, {bool caseSensitive = true}) {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(
+        FilterCondition.matches(
+          property: r'subscriptionUrl',
+          wildcard: pattern,
+          caseSensitive: caseSensitive,
+        ),
+      );
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterFilterCondition>
+  subscriptionUrlIsEmpty() {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(
+        FilterCondition.equalTo(property: r'subscriptionUrl', value: ''),
+      );
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterFilterCondition>
+  subscriptionUrlIsNotEmpty() {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(
+        FilterCondition.greaterThan(property: r'subscriptionUrl', value: ''),
+      );
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterFilterCondition>
+  threadsLimitIsNull() {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(
+        const FilterCondition.isNull(property: r'threadsLimit'),
+      );
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterFilterCondition>
+  threadsLimitIsNotNull() {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(
+        const FilterCondition.isNotNull(property: r'threadsLimit'),
+      );
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterFilterCondition>
+  threadsLimitEqualTo(int? value) {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(
+        FilterCondition.equalTo(property: r'threadsLimit', value: value),
+      );
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterFilterCondition>
+  threadsLimitGreaterThan(int? value, {bool include = false}) {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(
+        FilterCondition.greaterThan(
+          include: include,
+          property: r'threadsLimit',
+          value: value,
+        ),
+      );
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterFilterCondition>
+  threadsLimitLessThan(int? value, {bool include = false}) {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(
+        FilterCondition.lessThan(
+          include: include,
+          property: r'threadsLimit',
+          value: value,
+        ),
+      );
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterFilterCondition>
+  threadsLimitBetween(
+    int? lower,
+    int? upper, {
+    bool includeLower = true,
+    bool includeUpper = true,
+  }) {
+    return QueryBuilder.apply(this, (query) {
+      return query.addFilterCondition(
+        FilterCondition.between(
+          property: r'threadsLimit',
+          lower: lower,
+          includeLower: includeLower,
+          upper: upper,
+          includeUpper: includeUpper,
+        ),
+      );
+    });
+  }
 }
 
 extension ServerProfileQueryObject
@@ -977,6 +1403,46 @@ extension ServerProfileQuerySortBy
   QueryBuilder<ServerProfile, ServerProfile, QAfterSortBy> sortByPowerDesc() {
     return QueryBuilder.apply(this, (query) {
       return query.addSortBy(r'power', Sort.desc);
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterSortBy> sortBySubUuid() {
+    return QueryBuilder.apply(this, (query) {
+      return query.addSortBy(r'subUuid', Sort.asc);
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterSortBy> sortBySubUuidDesc() {
+    return QueryBuilder.apply(this, (query) {
+      return query.addSortBy(r'subUuid', Sort.desc);
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterSortBy>
+  sortBySubscriptionUrl() {
+    return QueryBuilder.apply(this, (query) {
+      return query.addSortBy(r'subscriptionUrl', Sort.asc);
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterSortBy>
+  sortBySubscriptionUrlDesc() {
+    return QueryBuilder.apply(this, (query) {
+      return query.addSortBy(r'subscriptionUrl', Sort.desc);
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterSortBy>
+  sortByThreadsLimit() {
+    return QueryBuilder.apply(this, (query) {
+      return query.addSortBy(r'threadsLimit', Sort.asc);
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterSortBy>
+  sortByThreadsLimitDesc() {
+    return QueryBuilder.apply(this, (query) {
+      return query.addSortBy(r'threadsLimit', Sort.desc);
     });
   }
 }
@@ -1055,6 +1521,46 @@ extension ServerProfileQuerySortThenBy
       return query.addSortBy(r'power', Sort.desc);
     });
   }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterSortBy> thenBySubUuid() {
+    return QueryBuilder.apply(this, (query) {
+      return query.addSortBy(r'subUuid', Sort.asc);
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterSortBy> thenBySubUuidDesc() {
+    return QueryBuilder.apply(this, (query) {
+      return query.addSortBy(r'subUuid', Sort.desc);
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterSortBy>
+  thenBySubscriptionUrl() {
+    return QueryBuilder.apply(this, (query) {
+      return query.addSortBy(r'subscriptionUrl', Sort.asc);
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterSortBy>
+  thenBySubscriptionUrlDesc() {
+    return QueryBuilder.apply(this, (query) {
+      return query.addSortBy(r'subscriptionUrl', Sort.desc);
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterSortBy>
+  thenByThreadsLimit() {
+    return QueryBuilder.apply(this, (query) {
+      return query.addSortBy(r'threadsLimit', Sort.asc);
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QAfterSortBy>
+  thenByThreadsLimitDesc() {
+    return QueryBuilder.apply(this, (query) {
+      return query.addSortBy(r'threadsLimit', Sort.desc);
+    });
+  }
 }
 
 extension ServerProfileQueryWhereDistinct
@@ -1094,6 +1600,31 @@ extension ServerProfileQueryWhereDistinct
       return query.addDistinctBy(r'power');
     });
   }
+
+  QueryBuilder<ServerProfile, ServerProfile, QDistinct> distinctBySubUuid({
+    bool caseSensitive = true,
+  }) {
+    return QueryBuilder.apply(this, (query) {
+      return query.addDistinctBy(r'subUuid', caseSensitive: caseSensitive);
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QDistinct>
+  distinctBySubscriptionUrl({bool caseSensitive = true}) {
+    return QueryBuilder.apply(this, (query) {
+      return query.addDistinctBy(
+        r'subscriptionUrl',
+        caseSensitive: caseSensitive,
+      );
+    });
+  }
+
+  QueryBuilder<ServerProfile, ServerProfile, QDistinct>
+  distinctByThreadsLimit() {
+    return QueryBuilder.apply(this, (query) {
+      return query.addDistinctBy(r'threadsLimit');
+    });
+  }
 }
 
 extension ServerProfileQueryProperty
@@ -1131,6 +1662,25 @@ extension ServerProfileQueryProperty
   QueryBuilder<ServerProfile, int?, QQueryOperations> powerProperty() {
     return QueryBuilder.apply(this, (query) {
       return query.addPropertyName(r'power');
+    });
+  }
+
+  QueryBuilder<ServerProfile, String?, QQueryOperations> subUuidProperty() {
+    return QueryBuilder.apply(this, (query) {
+      return query.addPropertyName(r'subUuid');
+    });
+  }
+
+  QueryBuilder<ServerProfile, String?, QQueryOperations>
+  subscriptionUrlProperty() {
+    return QueryBuilder.apply(this, (query) {
+      return query.addPropertyName(r'subscriptionUrl');
+    });
+  }
+
+  QueryBuilder<ServerProfile, int?, QQueryOperations> threadsLimitProperty() {
+    return QueryBuilder.apply(this, (query) {
+      return query.addPropertyName(r'threadsLimit');
     });
   }
 }

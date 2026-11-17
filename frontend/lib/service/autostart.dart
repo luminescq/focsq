@@ -1,4 +1,4 @@
-﻿// SPDX-FileCopyrightText: 2026 luminescq
+// SPDX-FileCopyrightText: 2026 luminescq
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 import 'dart:ffi';
 import 'dart:io';
@@ -6,6 +6,7 @@ import 'dart:isolate';
 
 import 'package:ffi/ffi.dart';
 
+import '../l10n/app_locale.dart';
 import 'logs.dart';
 
 class AutostartService {
@@ -30,6 +31,17 @@ class AutostartService {
     return Isolate.run(() => runHiddenProcess(commandLine));
   }
 
+  /// Очередь операций автозапуска: быстрые тапы не должны выполнять
+  /// /Delete и /Create вперегонки (иначе /Delete обгонит /Create и задача
+  /// «воскреснет» при выключенном тумблере).
+  static Future<void> _opQueue = Future.value();
+
+  static Future<bool> _enqueue(Future<bool> Function() operation) {
+    final result = _opQueue.then((_) => operation());
+    _opQueue = result.then((_) {}, onError: (_) {});
+    return result;
+  }
+
   static Future<bool> isEnabled() async {
     await init();
     if (Platform.isLinux) return _linuxIsEnabled();
@@ -38,7 +50,7 @@ class AutostartService {
       final result = await _run(['/Query', '/TN', _taskName]);
       return result == 0;
     } catch (error) {
-      LogService().add('[АВТОСТАРТ] Ошибка чтения состояния: $error');
+      LogService().add(S.autostartStateReadError(error));
       return false;
     }
   }
@@ -47,18 +59,44 @@ class AutostartService {
     await init();
     if (Platform.isLinux) return _linuxEnable();
     if (!Platform.isWindows) {
-      LogService().add(
-        '[АВТОСТАРТ] На этой платформе автозапуск не поддерживается',
-      );
+      LogService().add(S.autostartUnsupportedLog);
       return false;
     }
+    return _enqueue(_windowsEnable);
+  }
+
+  /// Слушатель реального состояния: опрашивает планировщик и пишет в журнал
+  /// то, что видит система, — независимо от результата операции.
+  static Future<void> _logVerification(bool expectedPresent) async {
+    try {
+      final probe = await _run(['/Query', '/TN', _taskName]);
+      final present = probe == 0;
+      if (expectedPresent && present) {
+        LogService().add(S.autostartVerifyPresentOk);
+      } else if (expectedPresent && !present) {
+        LogService().add(S.autostartVerifyPresentFail);
+      } else if (!expectedPresent && !present) {
+        LogService().add(S.autostartVerifyAbsentOk);
+      } else {
+        LogService().add(S.autostartVerifyAbsentFail);
+      }
+    } catch (_) {
+      LogService().add(S.autostartVerifyUnknown);
+    }
+  }
+
+  static Future<bool> _windowsEnable() async {
     try {
       final result = await _run([
         '/Create',
         '/TN',
         _taskName,
+        // ВНИМАНИЕ: _run склеивает аргументы пробелами и уходит в FFI
+        // CreateProcessW — никакого Dart-экранирования здесь нет. Значение
+        // /TR обязано содержать литеральные \" вокруг пути, иначе schtasks
+        // отрезает путь по пробелу и завершается с E_FAIL (0x80004005).
         '/TR',
-        '"$_exePath" $_args',
+        '"\\"$_exePath\\" --minimized"',
         '/SC',
         'ONLOGON',
         '/RL',
@@ -66,13 +104,14 @@ class AutostartService {
         '/F',
       ]);
       if (result != 0) {
-        LogService().add('[АВТОСТАРТ] Не удалось создать задачу (код $result)');
+        LogService().add(S.autostartTaskCreateFailed(result));
         return false;
       }
-      LogService().add('[АВТОСТАРТ] Задача создана (запуск от админа)');
+      LogService().add(S.autostartTaskCreatedLog);
+      await _logVerification(true);
       return true;
     } catch (error) {
-      LogService().add('[АВТОСТАРТ] Ошибка включения: $error');
+      LogService().add(S.autostartEnableError(error));
       return false;
     }
   }
@@ -81,16 +120,30 @@ class AutostartService {
     await init();
     if (Platform.isLinux) return _linuxDisable();
     if (!Platform.isWindows) return false;
+    return _enqueue(_windowsDisable);
+  }
+
+  static Future<bool> _windowsDisable() async {
     try {
       final result = await _run(['/Delete', '/TN', _taskName, '/F']);
-      if (result != 0) {
-        LogService().add('[АВТОСТАРТ] Не удалось удалить задачу (код $result)');
-        return false;
+      if (result == 0) {
+        LogService().add(S.autostartTaskDeletedLog);
+        await _logVerification(false);
+        return true;
       }
-      LogService().add('[АВТОСТАРТ] Задача удалена');
-      return true;
+      // «Задачи нет» — это тоже выключено: повторный OFF по уже удалённой
+      // задаче не должен выглядеть ошибкой и откатывать тумблер.
+      final probe = await _run(['/Query', '/TN', _taskName]);
+      if (probe != 0) {
+        LogService().add(S.autostartTaskDeletedLog);
+        await _logVerification(false);
+        return true;
+      }
+      LogService().add(S.autostartTaskDeleteFailed(result));
+      await _logVerification(false);
+      return false;
     } catch (error) {
-      LogService().add('[АВТОСТАРТ] Ошибка выключения: $error');
+      LogService().add(S.autostartDisableError(error));
       return false;
     }
   }
@@ -128,23 +181,18 @@ class AutostartService {
     final path = _linuxDesktopFile();
     final launcher = _launcherPath();
     if (path == null || launcher == null) {
-      LogService().add(
-        '[АВТОСТАРТ] Нет HOME/XDG_CONFIG_HOME — некуда писать запись',
-      );
+      LogService().add(S.autostartNoHomeLog);
       return false;
     }
     try {
       final file = File(path);
       await file.parent.create(recursive: true);
       await file.writeAsString(buildDesktopEntry(launcher), flush: true);
-      LogService().add('[АВТОСТАРТ] Запись создана: $path');
-      LogService().add(
-        '[АВТОСТАРТ] Перед первым автозапуском запусти FOCSQ из меню '
-        'и подтверди выдачу права туннеля (однократно)',
-      );
+      LogService().add(S.autostartEntryCreated(path));
+      LogService().add(S.autostartGrantHintLog);
       return true;
     } catch (error) {
-      LogService().add('[АВТОСТАРТ] Ошибка включения: $error');
+      LogService().add(S.autostartEnableError(error));
       return false;
     }
   }
@@ -156,11 +204,11 @@ class AutostartService {
       final file = File(path);
       if (await file.exists()) {
         await file.delete();
-        LogService().add('[АВТОСТАРТ] Запись удалена');
+        LogService().add(S.autostartEntryDeletedLog);
       }
       return true;
     } catch (error) {
-      LogService().add('[АВТОСТАРТ] Ошибка выключения: $error');
+      LogService().add(S.autostartDisableError(error));
       return false;
     }
   }
@@ -304,20 +352,16 @@ int runHiddenProcess(String commandLine) {
       processInfo,
     );
     if (ok == 0) {
-      throw Exception(
-        'Не удалось запустить процесс (GetLastError: ${_getLastError()})',
-      );
+      throw Exception(S.autostartRunFailed(_getLastError()));
     }
     final wait = _waitForSingleObject(processInfo.ref.hProcess, _waitTimeoutMs);
     if (wait != _waitObject0) {
-      throw Exception(
-        'Процесс не завершился за $_waitTimeoutMsмс (код ожидания $wait)',
-      );
+      throw Exception(S.autostartWaitTimeout(_waitTimeoutMs, wait));
     }
     final exitCode = calloc<Uint32>();
     try {
       if (_getExitCodeProcess(processInfo.ref.hProcess, exitCode) == 0) {
-        throw Exception('GetExitCodeProcess не удался');
+        throw Exception(S.autostartExitCodeFailed);
       }
       return exitCode.value;
     } finally {

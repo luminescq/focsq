@@ -39,13 +39,24 @@ DisableProgramGroupPage=yes
 Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
 
 ; vk_auth_data / vk_captcha_data — профильные данные WebView, появляются
-; в Release после локальных запусков приложения; в установщик не попадают.
+; в Release после локальных запусков приложения; *.log (wv_debug.log) —
+; рантайм-логи оттуда же. В установщик ни то, ни другое не попадает.
 [Files]
-Source: "{#ReleaseDir}\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion; Excludes: "vk_auth_data\*,vk_captcha_data\*"
+Source: "{#ReleaseDir}\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion; Excludes: "vk_auth_data\*,vk_captcha_data\*,*.log"
 
 [Icons]
-Name: "{group}\{#AppName}"; Filename: "{app}\focsq.exe"
-Name: "{autodesktop}\{#AppName}"; Filename: "{app}\focsq.exe"; Tasks: desktopicon
+; Ярлыки запускают asInvoker-заглушку: она фокусирует запущенное окно без
+; UAC или стартует focsq.exe (UAC один раз). Иконка — от focsq.exe.
+Name: "{group}\{#AppName}"; Filename: "{app}\focsq_stub.exe"; IconFilename: "{app}\focsq.exe"
+Name: "{autodesktop}\{#AppName}"; Filename: "{app}\focsq_stub.exe"; IconFilename: "{app}\focsq.exe"; Tasks: desktopicon
+
+[Registry]
+; csqtt:// links from a browser/Telegram. A second launch is forwarded to the
+; running instance before UAC (see main.cpp / deep_link.cpp).
+Root: HKA; Subkey: "Software\Classes\csqtt"; ValueType: string; ValueName: ""; ValueData: "URL:FOCSQ Protocol"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\csqtt"; ValueType: string; ValueName: "URL Protocol"; ValueData: ""; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\csqtt\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: """{app}\focsq.exe,0"""; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\csqtt\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\focsq.exe"" ""%1"""; Flags: uninsdeletekey
 
 [Tasks]
 Name: "desktopicon"; Description: "Ярлык на рабочем столе"; GroupDescription: "Дополнительно:"
@@ -53,12 +64,14 @@ Name: "autostart"; Description: "Запускать при входе в Windows
 
 ; Автозапуск через планировщик с правами админа — без UAC при входе
 [Run]
-Filename: "schtasks"; Parameters: "/Create /TN FOCSQ /TR """"{app}\focsq.exe"" --minimized"" /SC ONLOGON /RL HIGHEST /F"; Flags: runhidden; Tasks: autostart
+; /TR обязан получить ОДИН аргумент "путь + параметры": внутренние кавычки
+; экранируются \", иначе schtasks отрезает путь по пробелу (проверено).
+Filename: "{sys}\schtasks.exe"; Parameters: "/Create /TN FOCSQ /TR ""\""{app}\focsq.exe\"" --minimized"" /SC ONLOGON /RL HIGHEST /F"; Flags: runhidden; Tasks: autostart
 ; runascurrentuser: postinstall по умолчанию стартует от исходного (не
 ; повышенного) пользователя, а focsq.exe с requireAdministrator даёт
 ; CreateProcess code 740 — запускаем из контекста установщика (админ)
 Filename: "{app}\focsq.exe"; Description: "Запустить {#AppName}"; Flags: nowait postinstall skipifsilent runascurrentuser
 
 [UninstallRun]
-Filename: "schtasks"; Parameters: "/Delete /TN FOCSQ /F"; Flags: runhidden; RunOnceId: "DelTask"
+Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /TN FOCSQ /F"; Flags: runhidden; RunOnceId: "DelTask"
 Filename: "taskkill.exe"; Parameters: "/IM focsq.exe /F"; Flags: runhidden; RunOnceId: "KillApp"

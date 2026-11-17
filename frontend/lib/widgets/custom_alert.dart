@@ -1,4 +1,4 @@
-﻿// SPDX-FileCopyrightText: 2026 luminescq
+// SPDX-FileCopyrightText: 2026 luminescq
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 import 'dart:async';
 
@@ -16,8 +16,9 @@ class CustomAlert {
     required String title,
     required String message,
     AlertType type = AlertType.info,
+    OverlayState? overlay,
   }) {
-    final overlay = Overlay.of(context);
+    final target = overlay ?? Overlay.of(context);
     _hideActive();
 
     late final OverlayEntry overlayEntry;
@@ -36,7 +37,7 @@ class CustomAlert {
     );
 
     _active = overlayEntry;
-    overlay.insert(overlayEntry);
+    target.insert(overlayEntry);
   }
 
   static void _hideActive() {
@@ -80,8 +81,10 @@ class _AlertWidgetState extends State<_AlertWidget>
       vsync: this,
       duration: const Duration(milliseconds: 350),
     );
-    final curve =
-        CurvedAnimation(parent: _controller, curve: Curves.easeOutCubic);
+    final curve = CurvedAnimation(
+      parent: _controller,
+      curve: Curves.easeOutCubic,
+    );
     _slide = Tween<Offset>(
       begin: const Offset(1.1, 0),
       end: Offset.zero,
@@ -115,16 +118,16 @@ class _AlertWidgetState extends State<_AlertWidget>
   }
 
   IconData get _icon => switch (widget.type) {
-        AlertType.success => Icons.check_circle_rounded,
-        AlertType.warning => Icons.warning_amber_rounded,
-        AlertType.info => Icons.info_rounded,
-      };
+    AlertType.success => Icons.check_circle_rounded,
+    AlertType.warning => Icons.warning_amber_rounded,
+    AlertType.info => Icons.info_rounded,
+  };
 
   Color get _accentColor => switch (widget.type) {
-        AlertType.success => AppColors.success,
-        AlertType.warning => AppColors.warning,
-        AlertType.info => AppColors.info,
-      };
+    AlertType.success => AppColors.success,
+    AlertType.warning => AppColors.warning,
+    AlertType.info => AppColors.info,
+  };
 
   @override
   Widget build(BuildContext context) {
@@ -143,8 +146,7 @@ class _AlertWidgetState extends State<_AlertWidget>
               decoration: BoxDecoration(
                 color: AppColors.card,
                 borderRadius: BorderRadius.circular(12),
-                border:
-                    Border.all(color: Colors.white.withValues(alpha: 0.1)),
+                border: Border.all(color: Colors.white.withValues(alpha: 0.1)),
                 boxShadow: [
                   BoxShadow(
                     color: Colors.black.withValues(alpha: 0.5),
@@ -163,8 +165,9 @@ class _AlertWidgetState extends State<_AlertWidget>
                       color: _accentColor.withValues(alpha: 0.15),
                       shape: BoxShape.circle,
                     ),
-                    child:
-                        Center(child: Icon(_icon, size: 18, color: _accentColor)),
+                    child: Center(
+                      child: Icon(_icon, size: 18, color: _accentColor),
+                    ),
                   ),
                   const SizedBox(width: 16),
                   Expanded(

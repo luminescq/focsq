@@ -43,7 +43,7 @@ pub(crate) async fn solve_slider(
         "captchaNotRobot.getContent",
         &[
             ("session_token", session_token),
-            ("domain", "vk.com"),
+            ("domain", "vk.ru"),
             ("adFp", ""),
             ("access_token", ""),
             ("captcha_settings", settings),
@@ -79,7 +79,7 @@ pub(crate) async fn solve_slider(
         "captchaNotRobot.componentDone",
         &[
             ("session_token", session_token),
-            ("domain", "vk.com"),
+            ("domain", "vk.ru"),
             ("adFp", ""),
             ("access_token", ""),
             ("browser_fp", browser_fp),
@@ -142,6 +142,10 @@ fn parse_puzzle(raw: &Value) -> Result<SliderPuzzle> {
         .map_err(|error| anyhow!("decode slider image: {error}"))?;
     let image =
         image::load_from_memory(&data).map_err(|error| anyhow!("decode slider image: {error}"))?;
+    let (image_width, image_height) = image.dimensions();
+    if image_width < size as u32 || image_height < size as u32 {
+        bail!("slider image {image_width}x{image_height} smaller than grid {size}");
+    }
     Ok(SliderPuzzle {
         image,
         size,
@@ -355,7 +359,7 @@ fn seam_score_luma(image: &DynamicImage, grid_size: usize, mapping: &[usize]) ->
                     image,
                     left_destination,
                     left_source,
-                    left_destination.max_x - 1,
+                    left_destination.max_x.saturating_sub(1),
                     y,
                 ));
                 let right = luma(sample(
@@ -384,7 +388,7 @@ fn seam_score_luma(image: &DynamicImage, grid_size: usize, mapping: &[usize]) ->
                     top_destination,
                     top_source,
                     x,
-                    top_destination.max_y - 1,
+                    top_destination.max_y.saturating_sub(1),
                 ));
                 let bottom = luma(sample(
                     image,
@@ -431,7 +435,7 @@ fn seam_score_rgb_text(image: &DynamicImage, grid_size: usize, mapping: &[usize]
                     image,
                     left_destination,
                     left_source,
-                    left_destination.max_x - 1,
+                    left_destination.max_x.saturating_sub(1),
                     y,
                 );
                 let right = sample(
@@ -461,7 +465,7 @@ fn seam_score_rgb_text(image: &DynamicImage, grid_size: usize, mapping: &[usize]
                     top_destination,
                     top_source,
                     x,
-                    top_destination.max_y - 1,
+                    top_destination.max_y.saturating_sub(1),
                 );
                 let bottom = sample(
                     image,
@@ -563,10 +567,8 @@ pub(crate) fn build_checkbox_cursor() -> String {
         });
     }
     let transit_steps = random.random_range(3..6);
-    let control_x =
-        f64::from(start_x + target_x) / 2.0 - f64::from(random.random_range(8..28));
-    let control_y =
-        f64::from(start_y + target_y) / 2.0 + f64::from(random.random_range(6..24));
+    let control_x = f64::from(start_x + target_x) / 2.0 - f64::from(random.random_range(8..28));
+    let control_y = f64::from(start_y + target_y) / 2.0 + f64::from(random.random_range(6..24));
     for index in 1..=transit_steps {
         let time = f64::from(index) / f64::from(transit_steps + 1);
         let x = (1.0 - time).powi(2) * f64::from(start_x)

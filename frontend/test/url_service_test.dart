@@ -38,10 +38,7 @@ void main() {
 
     test('отсутствие хоста отклоняется', () {
       expect(() => UrlService.validated('https://'), throwsFormatException);
-      expect(
-        () => UrlService.validated('not-a-url'),
-        throwsFormatException,
-      );
+      expect(() => UrlService.validated('not-a-url'), throwsFormatException);
     });
   });
 

@@ -99,7 +99,17 @@ make.cmd
 tools/
 docs/
 
+# Python bytecode (dev/mock-subscription)
+__pycache__/
+*.pyc
+
 # Additional centralized ignores
 frontend/rust_builder/pubspec.lock
 *.[Cc]ache
 !*.[Cc]ache/
+dist/
+.agents/
+.entire/
+.pre-commit-config.yaml
+gpu.csv
+.forgejo/workflows/

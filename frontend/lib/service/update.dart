@@ -1,4 +1,4 @@
-﻿// SPDX-FileCopyrightText: 2026 luminescq
+// SPDX-FileCopyrightText: 2026 luminescq
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 import 'dart:async';
 import 'dart:convert';
@@ -8,6 +8,7 @@ import 'package:package_info_plus/package_info_plus.dart';
 
 import 'browser.dart';
 import 'db.dart';
+import '../l10n/app_locale.dart';
 import 'logs.dart';
 
 sealed class UpdateCheckResult {
@@ -75,10 +76,12 @@ class UpdateService {
 
   static String? get installedVersion => _installedVersion;
 
-  static bool get hasAvailableUpdate =>
-      _cachedVersion != null &&
-      _installedVersion != null &&
-      _cachedVersion != _installedVersion;
+  static bool get hasAvailableUpdate {
+    if (_cachedVersion == null || _installedVersion == null) return false;
+    // Строковое != не годится: «1.1.0-beta» != «1.0.0» показывал бы
+    // даунгрейд как доступное обновление. Решает только сравнение версий.
+    return _compareVersions(_installedVersion!, _cachedVersion!) < 0;
+  }
 
   static bool get isUpdateDismissed =>
       _cachedVersion != null && DbService.isUpdateSkipped(_cachedVersion!);
@@ -104,7 +107,7 @@ class UpdateService {
     final now = DateTime.now();
     if (_lastAutoCheck != null &&
         now.difference(_lastAutoCheck!) < _autoInterval) {
-      return const UpToDate('кэш');
+      return UpToDate(S.updateFromCache);
     }
     _lastAutoCheck = now;
 
@@ -140,13 +143,13 @@ class UpdateService {
           : _releasesPage;
 
       if (tag.isEmpty) {
-        return const UpdateCheckError('релиз без тега версии');
+        return UpdateCheckError(S.updateReleaseNoTag);
       }
       _cachedVersion = tag;
       _notifyListeners();
 
       if (_compareVersions(current, tag) < 0) {
-        _log('[ОБНОВЛЕНИЕ] Доступна версия $tag (установлена $current)');
+        _log(S.updateAvailableLog(tag, current));
         return UpdateAvailable(
           version: tag,
           currentVersion: current,
@@ -156,26 +159,26 @@ class UpdateService {
       }
       return UpToDate(current);
     } on FormatException catch (error) {
-      return UpdateCheckError('сервер вернул некорректный JSON: '
-          '${error.message}');
+      return UpdateCheckError(S.updateBadJson(error.message));
     } on _HttpError catch (error) {
-      return UpdateCheckError('сервер ответил: ${error.message}');
+      return UpdateCheckError(S.updateServerError(error.message));
     } on HttpException catch (error) {
-      return UpdateCheckError('нет сети: ${error.message}');
+      return UpdateCheckError(S.updateNoNetwork(error.message));
     } on TimeoutException {
-      return const UpdateCheckError('сервер не ответил за 15 секунд');
+      return UpdateCheckError(S.updateTimeout);
     } catch (error) {
-      return UpdateCheckError('проверка не удалась: $error');
+      return UpdateCheckError(S.updateCheckFailedMsg(error));
     }
   }
 
   static Future<Map<String, dynamic>> _fetchJson() async {
     final uri = Uri.parse(UrlService.validated(_releasesApi));
-    final client = HttpClient()..connectionTimeout = const Duration(seconds: 10);
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 10);
     try {
-      final request = await client.getUrl(uri).timeout(
-            const Duration(seconds: 15),
-          );
+      final request = await client
+          .getUrl(uri)
+          .timeout(const Duration(seconds: 15));
       request.headers.set(HttpHeaders.acceptHeader, 'application/json');
       request.headers.set(HttpHeaders.userAgentHeader, 'focsq-update-check');
       final response = await request.close().timeout(
@@ -190,7 +193,7 @@ class UpdateService {
       }
       final decoded = jsonDecode(body);
       if (decoded is! Map<String, dynamic>) {
-        throw const FormatException('ответ не является JSON-объектом');
+        throw FormatException(S.updateNotJsonObject);
       }
       return decoded;
     } finally {
@@ -220,9 +223,6 @@ class UpdateService {
     return 0;
   }
 
-  static String _releaseNotes(String body) => body
-      .split('\n')
-      .map((line) => line.trimRight())
-      .join('\n')
-      .trim();
+  static String _releaseNotes(String body) =>
+      body.split('\n').map((line) => line.trimRight()).join('\n').trim();
 }

@@ -1,6 +1,8 @@
-﻿// SPDX-FileCopyrightText: 2026 luminescq
+// SPDX-FileCopyrightText: 2026 luminescq
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 import 'package:flutter/material.dart';
+
+import '../l10n/app_locale.dart';
 import 'package:flutter_svg/flutter_svg.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 
@@ -31,7 +33,7 @@ class InfoScreen extends StatelessWidget {
     if (!opened && context.mounted) {
       CustomAlert.show(
         context,
-        title: 'Не удалось открыть браузер',
+        title: S.browserOpenFailed,
         message: url,
         type: AlertType.warning,
       );
@@ -52,8 +54,8 @@ class InfoScreen extends StatelessWidget {
           if (context.mounted) {
             CustomAlert.show(
               context,
-              title: 'Хорошо',
-              message: 'Напоминание про ${result.version} скрыто',
+              title: S.okTitle,
+              message: S.reminderHidden(result.version),
               type: AlertType.info,
             );
           }
@@ -63,23 +65,21 @@ class InfoScreen extends StatelessWidget {
       case UpToDate():
         CustomAlert.show(
           context,
-          title: 'Обновлений нет',
-          message: 'Установлена актуальная версия (${result.currentVersion})',
+          title: S.noUpdatesTitle,
+          message: S.upToDateMessage(result.currentVersion),
           type: AlertType.success,
         );
       case NoReleases():
         CustomAlert.show(
           context,
-          title: 'Обновлений нет',
-          message:
-              'Установлена ${result.currentVersion}. Публикованных релизов '
-              'на GitHub ещё нет — загляни позже.',
+          title: S.noUpdatesTitle,
+          message: S.noReleasesMessage(result.currentVersion),
           type: AlertType.info,
         );
       case UpdateCheckError():
         CustomAlert.show(
           context,
-          title: 'Проверка не удалась',
+          title: S.checkFailedTitle,
           message: result.message,
           type: AlertType.warning,
         );
@@ -89,7 +89,7 @@ class InfoScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return ScreenLayout(
-      title: 'Информация',
+      title: S.infoTitle,
       showDots: true,
       child: PanelContainer(
         child: Center(
@@ -124,8 +124,8 @@ class InfoScreen extends StatelessWidget {
                       ),
                       padding: const EdgeInsets.all(20),
                       alignment: Alignment.bottomLeft,
-                      child: const Text(
-                        'Информация',
+                      child: Text(
+                        S.infoTitle,
                         style: TextStyle(
                           color: AppColors.textPrimary,
                           fontSize: 20,
@@ -140,7 +140,7 @@ class InfoScreen extends StatelessWidget {
                     _WideActionCard(
                       iconAsset: AppIcons.github,
                       title: 'GITHUB',
-                      subtitle: 'Исходный код приложения',
+                      subtitle: S.sourceCode,
                       backgroundColor: AppColors.background,
                       onTap: () => _open(context, AppLinks.repo),
                     ),
@@ -151,16 +151,16 @@ class InfoScreen extends StatelessWidget {
                           Expanded(
                             child: _SquareActionCard(
                               iconAsset: AppIcons.report,
-                              title: 'Отчет',
-                              subtitle: 'Отчет о багах',
+                              title: S.report,
+                              subtitle: S.reportSubtitle,
                               backgroundColor: AppColors.cardHover,
                               onTap: () async {
                                 await ReportService.copyToClipboard();
                                 if (context.mounted) {
                                   CustomAlert.show(
                                     context,
-                                    title: 'Успех',
-                                    message: 'Отчет скопирован в буфер обмена!',
+                                    title: S.successTitle,
+                                    message: S.reportCopied,
                                     type: AlertType.success,
                                   );
                                 }
@@ -172,7 +172,7 @@ class InfoScreen extends StatelessWidget {
                             child: _SquareActionCard(
                               iconAsset: AppIcons.bug,
                               title: 'Issue',
-                              subtitle: 'Сообщить о проблеме',
+                              subtitle: S.reportIssue,
                               backgroundColor: AppColors.cardHover,
                               onTap: () => _open(context, AppLinks.issues),
                             ),
@@ -492,8 +492,8 @@ class _UpdateCardState extends State<_UpdateCard> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text(
-                  'Обновление',
+                Text(
+                  S.updateSection,
                   style: TextStyle(
                     color: AppColors.textPrimary,
                     fontSize: 16,
@@ -504,16 +504,20 @@ class _UpdateCardState extends State<_UpdateCard> {
                 FutureBuilder<PackageInfo>(
                   future: PackageInfo.fromPlatform(),
                   builder: (context, snapshot) {
+                    // «1.1.0-beta+1» показываем как «1.1.0 Beta» без
+                    // номера сборки: суффикс — статус релиза.
                     final installed = snapshot.hasData
                         ? snapshot.data!.version
+                              .split('+')
+                              .first
+                              .replaceFirst('-beta', ' Beta')
                         : '—';
                     final available = UpdateService.cachedVersion;
                     final text = hasUpdate
                         ? (UpdateService.isUpdateDismissed
-                              ? 'Установлена $installed · доступна $available '
-                                    '(напоминание скрыто)'
-                              : 'Установлена $installed · доступна $available')
-                        : 'Установлена $installed';
+                              ? S.updateStatusHidden(installed, available)
+                              : S.updateStatusAvailable(installed, available))
+                        : S.updateStatusInstalled(installed);
                     return Text(
                       text,
                       style: TextStyle(

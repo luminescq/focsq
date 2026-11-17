@@ -171,14 +171,58 @@ fn opera_pool() -> Vec<WeightedProfile> {
     )
 }
 
+/// OS-платформа для HTTP-фингерпринта.
+///
+/// Раньше random_profile выбирал OS независимо от реальной платформы
+/// (например, Linux-клиент мог отправить Android или Windows-профиль). Для
+/// VK Calls это создаёт противоречивую идентичность: desktop-программа с
+/// мобильным UA и TLS-профилем. Случайной оставляем только версию браузера.
+fn native_platform_os() -> ImpersonateOS {
+    #[cfg(target_os = "windows")]
+    {
+        return ImpersonateOS::Windows;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return ImpersonateOS::Linux;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return ImpersonateOS::MacOS;
+    }
+    #[cfg(target_os = "android")]
+    {
+        return ImpersonateOS::Android;
+    }
+    #[cfg(target_os = "ios")]
+    {
+        return ImpersonateOS::IOS;
+    }
+    #[allow(unreachable_code)]
+    ImpersonateOS::Windows
+}
+
 pub fn random_profile(fingerprint: &str) -> Profile {
-    let (impersonate, os) = match fingerprint {
+    let (impersonate, selected_os) = match fingerprint {
         "safari" => pick_weighted(&safari_pool()),
         "firefox" => pick_weighted(&firefox_pool()),
         "edge" => pick_weighted(&edge_pool()),
         "opera" => pick_weighted(&opera_pool()),
         _ => pick_weighted(&chrome_pool()),
     };
+
+    // Safari поддерживает только macOS/iOS в primp. На Windows/Linux
+    // сохраняем валидный Safari/macOS профиль; остальные браузеры обязаны
+    // совпадать с реальной desktop-платформой.
+    let os = if fingerprint == "safari" {
+        match selected_os {
+            ImpersonateOS::IOS | ImpersonateOS::MacOS => selected_os,
+            _ => ImpersonateOS::MacOS,
+        }
+    } else {
+        native_platform_os()
+    };
+
     Profile {
         impersonate,
         os,
@@ -205,35 +249,28 @@ mod tests {
     }
 
     #[test]
-    fn chrome_profiles_produce_diverse_versions_and_os_combinations() {
-        assert_eq!(chrome_pool().len(), 25);
-        let mut seen = HashSet::new();
+    fn desktop_profiles_use_native_os_and_vary_browser_versions() {
+        let mut chrome_versions = HashSet::new();
+        let mut firefox_versions = HashSet::new();
         for _ in 0..1_000 {
-            let profile = random_profile("chrome");
-            seen.insert(format!("{:?}/{:?}", profile.impersonate, profile.os));
+            let chrome = random_profile("chrome");
+            let firefox = random_profile("firefox");
+            assert_eq!(chrome.os, native_platform_os());
+            assert_eq!(firefox.os, native_platform_os());
+            chrome_versions.insert(format!("{:?}", chrome.impersonate));
+            firefox_versions.insert(format!("{:?}", firefox.impersonate));
         }
-        assert!(
-            seen.len() >= 8,
-            "Chrome diversity too low: only {} unique profiles: {:?}",
-            seen.len(),
-            seen
-        );
+        assert!(chrome_versions.len() >= 4);
+        assert!(firefox_versions.len() >= 4);
     }
 
     #[test]
-    fn firefox_profiles_produce_diverse_combinations() {
-        assert_eq!(firefox_pool().len(), 20);
-        let mut seen = HashSet::new();
-        for _ in 0..1_000 {
-            let profile = random_profile("firefox");
-            seen.insert(format!("{:?}/{:?}", profile.impersonate, profile.os));
+    fn edge_and_opera_profiles_use_native_os() {
+        for fingerprint in ["edge", "opera"] {
+            for _ in 0..100 {
+                assert_eq!(random_profile(fingerprint).os, native_platform_os());
+            }
         }
-        assert!(
-            seen.len() >= 6,
-            "Firefox diversity too low: only {} unique profiles: {:?}",
-            seen.len(),
-            seen
-        );
     }
 
     #[test]
@@ -246,45 +283,6 @@ mod tests {
                 ImpersonateOS::MacOS | ImpersonateOS::IOS
             ));
         }
-    }
-
-    #[test]
-    fn edge_profiles_produce_diverse_combinations() {
-        assert_eq!(edge_pool().len(), 25);
-        let mut seen = HashSet::new();
-        for _ in 0..1_000 {
-            let profile = random_profile("edge");
-            assert!(matches!(
-                profile.impersonate,
-                Impersonate::EdgeV144
-                    | Impersonate::EdgeV145
-                    | Impersonate::EdgeV146
-                    | Impersonate::EdgeV147
-                    | Impersonate::EdgeV148
-            ));
-            seen.insert(format!("{:?}/{:?}", profile.impersonate, profile.os));
-        }
-        assert!(seen.len() >= 8, "Edge diversity too low: {seen:?}");
-    }
-
-    #[test]
-    fn opera_profiles_produce_diverse_combinations() {
-        assert_eq!(opera_pool().len(), 30);
-        let mut seen = HashSet::new();
-        for _ in 0..1_000 {
-            let profile = random_profile("opera");
-            assert!(matches!(
-                profile.impersonate,
-                Impersonate::OperaV126
-                    | Impersonate::OperaV127
-                    | Impersonate::OperaV128
-                    | Impersonate::OperaV129
-                    | Impersonate::OperaV130
-                    | Impersonate::OperaV131
-            ));
-            seen.insert(format!("{:?}/{:?}", profile.impersonate, profile.os));
-        }
-        assert!(seen.len() >= 8, "Opera diversity too low: {seen:?}");
     }
 
     #[test]

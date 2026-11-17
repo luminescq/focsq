@@ -1,23 +1,20 @@
-﻿// SPDX-FileCopyrightText: 2026 luminescq
+// SPDX-FileCopyrightText: 2026 luminescq
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 import 'package:flutter/material.dart';
 import '../models/app_settings.dart';
+import '../service/worker_limits.dart';
 import '../theme/app_colors.dart';
 
-int resolveMaxPowerThreads(AppSettings settings) {
-  var max = settings.extraThreads ? 162 : 90;
-  if (settings.hashes == 'Ручной') {
-    final hashCount = settings.customHashes
-        .split(',')
-        .where((value) => value.trim().isNotEmpty)
-        .length;
-    final cappedByHashes = hashCount * 27;
-    if (hashCount > 0 && cappedByHashes < max) {
-      max = cappedByHashes;
-    }
-  }
-  return max < 9 ? 9 : max;
+/// Число делений слайдера мощности. `Slider` падает при divisions == 0,
+/// а при max == min делений быть не должно.
+int? sliderDivisionsFor(double maxPower) {
+  if (maxPower <= 10) return null;
+  final divisions = ((maxPower - 10) / 10).round();
+  return divisions < 1 ? 1 : divisions;
 }
+
+int resolveMaxPowerThreads(AppSettings settings) =>
+    WorkerLimits.maxPower(settings);
 
 class CustomTextField extends StatelessWidget {
   final String hint;
@@ -171,12 +168,14 @@ class CustomDropdown extends StatefulWidget {
   final String value;
   final List<String> items;
   final ValueChanged<String> onChanged;
+  final double? popupWidth;
 
   const CustomDropdown({
     super.key,
     required this.value,
     required this.items,
     required this.onChanged,
+    this.popupWidth,
   });
 
   @override
@@ -230,6 +229,12 @@ class _CustomDropdownState extends State<CustomDropdown>
       setState(() => _isOpen = true);
     }
     _animationController.forward(from: 0.0);
+
+    final renderBox = context.findRenderObject() as RenderBox?;
+    final triggerWidth = renderBox?.size.width ?? 170.0;
+    final effectiveWidth =
+        widget.popupWidth ?? (triggerWidth > 170.0 ? triggerWidth : 170.0);
+
     _overlayEntry = OverlayEntry(
       builder: (context) => Stack(
         children: [
@@ -242,12 +247,14 @@ class _CustomDropdownState extends State<CustomDropdown>
           ),
           CompositedTransformFollower(
             link: _layerLink,
-            offset: const Offset(0, 44),
+            targetAnchor: Alignment.bottomRight,
+            followerAnchor: Alignment.topRight,
+            offset: const Offset(0, 6),
             showWhenUnlinked: false,
             child: Material(
               color: Colors.transparent,
               child: ScaleTransition(
-                alignment: Alignment.topCenter,
+                alignment: Alignment.topRight,
                 scale: Tween<double>(begin: 0.9, end: 1.0).animate(
                   CurvedAnimation(
                     parent: _animationController,
@@ -259,22 +266,22 @@ class _CustomDropdownState extends State<CustomDropdown>
                     parent: _animationController,
                     curve: Curves.easeOut,
                   ),
-          child: Container(
-            width: 170,
-            decoration: BoxDecoration(
-              color: AppColors.card,
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(
-                color: Colors.white.withValues(alpha: 0.1),
-              ),
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.black.withValues(alpha: 0.5),
-                  blurRadius: 10,
-                  offset: const Offset(0, 4),
-                ),
-              ],
-            ),
+                  child: Container(
+                    width: effectiveWidth,
+                    decoration: BoxDecoration(
+                      color: AppColors.card,
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(
+                        color: Colors.white.withValues(alpha: 0.1),
+                      ),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withValues(alpha: 0.5),
+                          blurRadius: 10,
+                          offset: const Offset(0, 4),
+                        ),
+                      ],
+                    ),
                     child: ClipRRect(
                       borderRadius: BorderRadius.circular(12),
                       child: Column(
@@ -391,26 +398,145 @@ class _DropdownItemState extends State<_DropdownItem> {
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
           child: Row(
             children: [
-              Text(
-                widget.text,
-                style: TextStyle(
-                  color: widget.isSelected
-                      ? Colors.white
-                      : AppColors.textSecondary,
-                  fontSize: 13,
-                  fontWeight: widget.isSelected
-                      ? FontWeight.w700
-                      : FontWeight.w600,
+              Expanded(
+                child: Text(
+                  widget.text,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: widget.isSelected
+                        ? Colors.white
+                        : AppColors.textSecondary,
+                    fontSize: 13,
+                    fontWeight: widget.isSelected
+                        ? FontWeight.w700
+                        : FontWeight.w600,
+                  ),
                 ),
               ),
               if (widget.isSelected) ...[
-                const Spacer(),
+                const SizedBox(width: 8),
                 const Icon(Icons.check, color: AppColors.textPrimary, size: 16),
               ],
             ],
           ),
         ),
       ),
+    );
+  }
+}
+
+class CustomSwitch extends StatelessWidget {
+  final bool value;
+  final ValueChanged<bool> onChanged;
+
+  const CustomSwitch({super.key, required this.value, required this.onChanged});
+
+  @override
+  Widget build(BuildContext context) {
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      child: GestureDetector(
+        onTap: () => onChanged(!value),
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 200),
+          width: 44,
+          height: 24,
+          padding: const EdgeInsets.all(3),
+          decoration: BoxDecoration(
+            color: value ? AppColors.buttonPrimary : AppColors.buttonSecondary,
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(
+              color: value
+                  ? Colors.transparent
+                  : Colors.white.withValues(alpha: 0.1),
+            ),
+          ),
+          child: AnimatedAlign(
+            duration: const Duration(milliseconds: 200),
+            curve: Curves.easeInOut,
+            alignment: value ? Alignment.centerRight : Alignment.centerLeft,
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 200),
+              width: 18,
+              height: 18,
+              decoration: BoxDecoration(
+                color: value ? Colors.black : Colors.white,
+                shape: BoxShape.circle,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class CustomTextArea extends StatelessWidget {
+  final String hint;
+  final TextEditingController? controller;
+  final String? error;
+  final int minLines;
+  final int maxLines;
+
+  const CustomTextArea({
+    super.key,
+    required this.hint,
+    this.controller,
+    this.error,
+    this.minLines = 4,
+    this.maxLines = 8,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          decoration: BoxDecoration(
+            color: AppColors.buttonSecondary,
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: TextField(
+            controller: controller,
+            minLines: minLines,
+            maxLines: maxLines,
+            style: const TextStyle(
+              color: AppColors.textPrimary,
+              fontSize: 13,
+              fontFamily: 'Consolas',
+              height: 1.4,
+            ),
+            decoration: InputDecoration(
+              hintText: hint,
+              hintStyle: const TextStyle(
+                color: AppColors.textSecondary,
+                fontSize: 13,
+                height: 1.4,
+              ),
+              border: InputBorder.none,
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 16,
+                vertical: 12,
+              ),
+            ),
+          ),
+        ),
+        if (error != null)
+          Padding(
+            padding: const EdgeInsets.only(left: 2, top: 4),
+            child: Text(
+              error!,
+              style: const TextStyle(
+                color: AppColors.warning,
+                fontSize: 11,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ),
+      ],
     );
   }
 }

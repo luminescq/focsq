@@ -1,4 +1,4 @@
-﻿// SPDX-FileCopyrightText: 2026 amurcanov
+// SPDX-FileCopyrightText: 2026 amurcanov
 // SPDX-FileCopyrightText: 2026 luminescq
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
@@ -77,7 +77,8 @@ fn parse_cidr(cidr: &str) -> Result<(Ipv4Addr, u8)> {
 }
 
 fn parse_addr(text: &str) -> Result<Ipv4Addr> {
-    text.parse().with_context(|| format!("некорректный IP: {text}"))
+    text.parse()
+        .with_context(|| format!("некорректный IP: {text}"))
 }
 
 /// Маска префикса как u32 в «старшем-первый» представлении (255.255.255.0 → 0xFFFFFF00).
@@ -153,9 +154,8 @@ fn nl_header(length: u32, kind: u16, flags: u16) -> NlMsgHeader {
 }
 
 fn push_bytes<T>(buffer: &mut Vec<u8>, value: &T) {
-    let bytes = unsafe {
-        std::slice::from_raw_parts((value as *const T).cast(), std::mem::size_of::<T>())
-    };
+    let bytes =
+        unsafe { std::slice::from_raw_parts((value as *const T).cast(), std::mem::size_of::<T>()) };
     buffer.extend_from_slice(bytes);
 }
 
@@ -177,8 +177,13 @@ fn push_rta(buffer: &mut Vec<u8>, kind: u16, payload: &[u8]) {
 /// если ACK не пришёл за отведённое время, считаем тихий успех (успешный
 /// RTM_NEWROUTE с NLM_F_ACK отвечает мгновенно; тишина дольше — аномалия).
 fn open_rtnetlink() -> Result<File> {
-    let descriptor =
-        unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW | libc::SOCK_CLOEXEC, libc::NETLINK_ROUTE) };
+    let descriptor = unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+            libc::NETLINK_ROUTE,
+        )
+    };
     if descriptor < 0 {
         return Err(std::io::Error::last_os_error()).context("netlink socket");
     }
@@ -195,7 +200,8 @@ fn open_rtnetlink() -> Result<File> {
             (&timeout as *const libc::timeval).cast(),
             std::mem::size_of::<libc::timeval>() as libc::socklen_t,
         )
-    } < 0 {
+    } < 0
+    {
         return Err(std::io::Error::last_os_error()).context("SO_RCVTIMEO");
     }
     // SAFETY: дескриптор только что создан и ещё ничей
@@ -247,8 +253,7 @@ fn route_add(
         &nl_header(
             0, // дозаполним после сборки
             libc::RTM_NEWROUTE as u16,
-            (libc::NLM_F_REQUEST | libc::NLM_F_CREATE | libc::NLM_F_EXCL
-                | libc::NLM_F_ACK) as u16,
+            (libc::NLM_F_REQUEST | libc::NLM_F_CREATE | libc::NLM_F_EXCL | libc::NLM_F_ACK) as u16,
         ),
     );
     push_bytes(
@@ -369,7 +374,14 @@ fn receive_netlink_error(socket: &File) -> Result<Option<String>> {
         if Instant::now() > deadline {
             return Ok(None);
         }
-        let received = unsafe { libc::recv(socket.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len(), 0) };
+        let received = unsafe {
+            libc::recv(
+                socket.as_raw_fd(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                0,
+            )
+        };
         if received < 0 {
             let error = std::io::Error::last_os_error();
             if error.kind() == std::io::ErrorKind::WouldBlock {
@@ -452,7 +464,8 @@ fn parse_route_rows() -> Result<Vec<RouteRow>> {
             fields.next(),
             fields.next(),
             fields.next(),
-        ) else {
+        )
+        else {
             continue;
         };
         let (Ok(destination), Ok(gateway), Ok(flags), Ok(mask)) = (
@@ -477,11 +490,13 @@ fn parse_route_rows() -> Result<Vec<RouteRow>> {
 /// Исходный default-маршрут: сеть 0.0.0.0/0 через шлюз (RTF_GATEWAY).
 fn find_default_gateway() -> Result<(Ipv4Addr, i32)> {
     for row in parse_route_rows()? {
-        if row.destination == 0
-            && row.mask == 0
-            && row.flags & 2 != 0 // RTF_GATEWAY
+        if row.destination == 0 && row.mask == 0 && row.flags & 2 != 0
+        // RTF_GATEWAY
         {
-            return Ok((Ipv4Addr::from(row.gateway), interface_index(&row.interface)?));
+            return Ok((
+                Ipv4Addr::from(row.gateway),
+                interface_index(&row.interface)?,
+            ));
         }
     }
     bail!("default-маршрут не найден — нет сети?")
@@ -548,9 +563,8 @@ impl TunDevice {
             )
         };
         if descriptor < 0 {
-            return Err(std::io::Error::last_os_error()).context(
-                "не удалось открыть /dev/net/tun (нужен root или setcap cap_net_admin)",
-            );
+            return Err(std::io::Error::last_os_error())
+                .context("не удалось открыть /dev/net/tun (нужен root или setcap cap_net_admin)");
         }
         // SAFETY: дескриптор только что создан и ещё ничей
         let file = unsafe { File::from_raw_fd(descriptor) };
@@ -583,8 +597,7 @@ impl TunDevice {
     /// Дублированный дескриптор для poll-циклов (AsyncFd). Владение
     /// устройством остаётся у TunDevice: закрытие дубля цикл не роняет.
     pub fn poll_fd(&self) -> Result<OwnedFd> {
-        let copy =
-            unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        let copy = unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
         if copy < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
@@ -604,7 +617,8 @@ impl TunDevice {
             return Err(std::io::Error::last_os_error().into());
         }
         let status = unsafe { libc::fcntl(copy, libc::F_GETFL) };
-        if status < 0 || unsafe { libc::fcntl(copy, libc::F_SETFL, status | libc::O_NONBLOCK) } < 0 {
+        if status < 0 || unsafe { libc::fcntl(copy, libc::F_SETFL, status | libc::O_NONBLOCK) } < 0
+        {
             return Err(std::io::Error::last_os_error().into());
         }
         // SAFETY: дублированный дескриптор, владение передаётся File
@@ -617,7 +631,8 @@ impl TunDevice {
 // ===========================================================================
 
 fn ioctl_socket() -> Result<i32> {
-    let descriptor = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    let descriptor =
+        unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
     if descriptor < 0 {
         return Err(std::io::Error::last_os_error().into());
     }
@@ -677,7 +692,8 @@ fn set_address(name: &str, address: Ipv4Addr, mtu: usize) -> Result<()> {
             (libc::SIOCSIFNETMASK, &ifreq_mask, "маска"),
             (libc::SIOCSIFMTU, &ifreq_mtu, "MTU"),
         ] {
-            if unsafe { libc::ioctl(descriptor, request, ifreq.as_ptr() as *mut libc::c_void) } < 0 {
+            if unsafe { libc::ioctl(descriptor, request, ifreq.as_ptr() as *mut libc::c_void) } < 0
+            {
                 bail!("SIOCSIF-{what}: {}", std::io::Error::last_os_error());
             }
         }
@@ -693,9 +709,8 @@ fn set_address(name: &str, address: Ipv4Addr, mtu: usize) -> Result<()> {
             bail!("SIOCGIFFLAGS: {}", std::io::Error::last_os_error());
         }
         // ifr_flags — начало union (offset 16)
-        let mut flags = unsafe {
-            std::ptr::read_unaligned(ifreq_flags[16..].as_ptr().cast::<libc::c_short>())
-        };
+        let mut flags =
+            unsafe { std::ptr::read_unaligned(ifreq_flags[16..].as_ptr().cast::<libc::c_short>()) };
         flags |= libc::IFF_UP as libc::c_short | libc::IFF_RUNNING as libc::c_short;
         ifreq_flags[16..18].copy_from_slice(&flags.to_ne_bytes());
         if unsafe { libc::ioctl(descriptor, libc::SIOCSIFFLAGS, ifreq_flags.as_mut_ptr()) } < 0 {

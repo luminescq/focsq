@@ -1,7 +1,8 @@
-﻿// SPDX-FileCopyrightText: 2026 luminescq
+// SPDX-FileCopyrightText: 2026 luminescq
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 import 'dart:io';
 
+import '../l10n/app_locale.dart';
 import 'logs.dart';
 
 class TunRights {
@@ -15,8 +16,9 @@ class TunRights {
 
   static Future<bool> hasCapNetAdmin({String? statusFile}) async {
     try {
-      final lines = await File(statusFile ?? '/proc/self/status')
-          .readAsLines(encoding: const SystemEncoding());
+      final lines = await File(
+        statusFile ?? '/proc/self/status',
+      ).readAsLines(encoding: const SystemEncoding());
       for (final line in lines) {
         if (!line.startsWith('CapEff:')) continue;
         final value = int.tryParse(line.substring(7).trim(), radix: 16);
@@ -41,26 +43,22 @@ class TunRights {
     if (await hasCapNetAdmin(statusFile: statusFile)) return null;
 
     if (wrapper == null) {
-      LogService().add('[TUN] Права нет, обёртки focsq-tun нет рядом');
-      return 'Нет права на туннель (cap_net_admin) и рядом с приложением '
-          'нет обёртки focsq-tun. Запусти приложение через focsq.sh';
+      LogService().add(S.tunNoWrapperLog);
+      return S.tunNoWrapperIssue;
     }
 
     if (env['FOCSQ_NO_GRANT'] == '1') {
-      LogService().add('[TUN] Права нет, выдача отключена (FOCSQ_NO_GRANT)');
-      return 'Нет права на туннель (cap_net_admin). Запусти приложение '
-          'через focsq.sh или без переменной FOCSQ_NO_GRANT';
+      LogService().add(S.tunGrantDisabledLog);
+      return S.tunGrantDisabledIssue;
     }
 
-    final error =
-        await (grant?.call(wrapper) ?? _pkexecSetcap(wrapper, env));
+    final error = await (grant?.call(wrapper) ?? _pkexecSetcap(wrapper, env));
     if (error != null) {
-      LogService().add('[TUN] Выдача права не удалась: $error');
+      LogService().add(S.tunGrantErrorLog(error));
       return error;
     }
 
-    LogService()
-        .add('[TUN] Право выдано (focsq-tun) — перезапускаю приложение');
+    LogService().add(S.tunGrantedLog);
     await (onGranted?.call(wrapper) ?? _restartThroughWrapper(wrapper));
     return null;
   }
@@ -70,22 +68,20 @@ class TunRights {
     Map<String, String> env,
   ) async {
     try {
-      final result = await Process.run(
-        'pkexec',
-        ['setcap', 'cap_net_admin+ep', wrapper],
-        environment: env,
-      );
+      final result = await Process.run('pkexec', [
+        'setcap',
+        'cap_net_admin+ep',
+        wrapper,
+      ], environment: env);
       if (result.exitCode == 0) return null;
       final stderr = (result.stderr is String)
           ? (result.stderr as String).trim()
           : '';
       return stderr.isEmpty
-          ? 'Выдача права TUN отменена или не удалась '
-              '(pkexec, код ${result.exitCode})'
-          : 'Выдача права TUN не удалась: $stderr';
+          ? S.tunPkexecCancelled(result.exitCode)
+          : S.tunPkexecFailed(stderr);
     } catch (error) {
-      return 'pkexec недоступен — выдай право вручную в терминале:\n'
-          'sudo setcap cap_net_admin+ep "$wrapper"\n($error)';
+      return S.tunPkexecUnavailable(wrapper, error);
     }
   }
 
@@ -101,7 +97,7 @@ class TunRights {
         mode: ProcessStartMode.detached,
       );
     } catch (error) {
-      LogService().add('[TUN] Перезапуск не удался: $error');
+      LogService().add(S.tunRestartFailed(error));
       return;
     }
     exit(0);

@@ -1,6 +1,8 @@
-﻿// SPDX-FileCopyrightText: 2026 luminescq
+// SPDX-FileCopyrightText: 2026 luminescq
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 import 'dart:async';
+
+import '../l10n/app_locale.dart';
 
 import 'package:isar/isar.dart';
 import 'package:path_provider/path_provider.dart';
@@ -23,8 +25,7 @@ class DbService {
     );
   }
 
-  static Isar get _db =>
-      _isar ?? (throw StateError('DbService.init() не вызван'));
+  static Isar get _db => _isar ?? (throw StateError(S.dbNotInitialized));
   static Stream<List<ServerProfile>> watchProfiles() {
     return _db.serverProfiles
         .where()
@@ -41,9 +42,53 @@ class DbService {
     await _db.writeTxn(() => _db.serverProfiles.put(profile));
   }
 
-  static Future<void> deleteProfile(int id) async {
-    await _db.writeTxn(() => _db.serverProfiles.delete(id));
+  static Future<void> saveProfiles(List<ServerProfile> profiles) async {
+    if (profiles.isEmpty) return;
+    await _db.writeTxn(() => _db.serverProfiles.putAll(profiles));
   }
+
+  static Future<void> deleteProfiles(List<int> ids) async {
+    if (ids.isEmpty) return;
+    await _db.writeTxn(() async {
+      await _db.serverProfiles.deleteAll(ids);
+      final settings = await _db.appSettings.get(AppSettings.singletonId);
+      if (settings != null && ids.contains(settings.activeProfileId)) {
+        settings.activeProfileId = null;
+        await _db.appSettings.put(settings);
+        _settingsCache = settings;
+      }
+    });
+  }
+
+  static Future<void> saveImportedProfiles(
+    List<ServerProfile> profiles, {
+    List<int> deleteIds = const [],
+    void Function(AppSettings settings)? updateSettings,
+  }) async {
+    await _db.writeTxn(() async {
+      if (deleteIds.isNotEmpty) {
+        await _db.serverProfiles.deleteAll(deleteIds);
+      }
+      if (profiles.isNotEmpty) {
+        await _db.serverProfiles.putAll(profiles);
+      }
+      if (updateSettings == null && deleteIds.isEmpty) return;
+      final settings =
+          await _db.appSettings.get(AppSettings.singletonId) ?? AppSettings();
+      var changed = updateSettings != null;
+      if (deleteIds.contains(settings.activeProfileId)) {
+        settings.activeProfileId = null;
+        changed = true;
+      }
+      updateSettings?.call(settings);
+      if (changed) {
+        await _db.appSettings.put(settings);
+        _settingsCache = settings;
+      }
+    });
+  }
+
+  static Future<void> deleteProfile(int id) => deleteProfiles([id]);
 
   static Future<ServerProfile?> getProfile(int? id) async {
     if (id == null) return null;

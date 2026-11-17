@@ -85,6 +85,15 @@ class WebView {
 
   bool triggerOnUrlRequestedEvent{true};
 
+  // WebView2 игнорирует Navigate(), вызванный до того, как отменённая
+  // навигация дошла до NavigationCompleted (остаётся about:blank). Поэтому
+  // разрешённый Dart-стороной URL запоминаем и переходим на него после
+  // завершения отмены.
+  bool navigation_cancelling_{false};
+  std::wstring pending_navigation_url_;
+
+  void NavigatePending();
+
   void OnWebviewControllerCreated();
 
   [[nodiscard]] bool CanGoBack() const;

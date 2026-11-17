@@ -12,6 +12,7 @@ use crate::{
     session::{
         ConfigDeliveryState, SessionConfig, SessionRuntime, ShutdownCoordinator, run_session,
     },
+    srtp_mode::SrtpMode,
     stats::Stats,
     wrap::derive_wrap_key,
 };
@@ -457,7 +458,7 @@ async fn tcp_turn_transport_allocates_without_udp_fallback() {
     let mut packet = pool.acquire();
     packet.read_area()[..8].copy_from_slice(b"tcp-data");
     packet.set_read_len(8).unwrap();
-    allocation.send_with_duplicate(packet, false).await.unwrap();
+    allocation.send(packet).await.unwrap();
     tokio::time::timeout(Duration::from_secs(3), data_rx)
         .await
         .unwrap()
@@ -554,7 +555,7 @@ async fn authenticated_flow_survives_pool_deficit_and_keeps_channel_data_zero_co
 
     held.read_area()[..8].copy_from_slice(b"outbound");
     held.set_read_len(8).unwrap();
-    allocation.send_with_duplicate(held, false).await.unwrap();
+    allocation.send(held).await.unwrap();
 
     let mut inbound = tokio::time::timeout(Duration::from_secs(3), receiver.recv())
         .await
@@ -681,8 +682,20 @@ async fn data_batches_preserve_channel_order_and_release_idle_pool_leases() {
         packet.set_read_len(payload.len()).unwrap();
         packets.push(packet);
     }
-    allocation.send_data_batch(&mut packets).await.unwrap();
+    for packet in packets.drain(..) {
+        allocation.send(packet).await.unwrap();
+    }
     drop(packets);
+
+    // Деаллокация не должна обгонять данные, ещё буферизованные в воркере
+    // отправки: слот пула возвращается только после socket-отправки.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while pool.available() != pool.capacity() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
 
     tokio::time::timeout(Duration::from_secs(2), allocation.deallocate())
         .await
@@ -804,10 +817,7 @@ async fn channel_bind_error_closes_data_gate_but_preserves_refresh_zero_control_
     let mut packet = pool.acquire();
     packet.read_area()[..7].copy_from_slice(b"blocked");
     packet.set_read_len(7).unwrap();
-    let send_error = allocation
-        .send_with_duplicate(packet, false)
-        .await
-        .unwrap_err();
+    let send_error = allocation.send(packet).await.unwrap_err();
     assert!(format!("{send_error:#}").contains("ChannelBind"));
 
     tokio::time::timeout(Duration::from_secs(2), allocation.deallocate())
@@ -952,10 +962,11 @@ async fn cancelled_before_first_control_send_never_creates_allocation() {
         control_sent: AtomicBool::new(false),
         channel: AtomicU16::new(0),
         queue_full_drops: AtomicU64::new(0),
+        outbound_queue_full_drops: AtomicU64::new(0),
         pool_deficit_drops: AtomicU64::new(0),
         native_pumps: AtomicU64::new(0),
     });
-    let (incoming, _receiver) = mpsc::channel(1);
+    let (incoming, _receiver) = crate::spsc_ring::channel(1);
     core.start_allocation().unwrap();
     shared.request_cleanup();
     let driver = tokio::spawn(driver_loop(DriverRuntime {
@@ -1375,6 +1386,8 @@ async fn windows_client_reaches_wsl_server_through_a_real_turn_channel_and_dispa
             salt: Arc::from("e2e-windows-generation"),
             mode: ObfsMode::Audio,
             wrap_key: derive_wrap_key(&password).unwrap(),
+            srtp_mode: SrtpMode::Wrap,
+            client_wrap_key: [0; 32],
             get_config: true,
             desired_count: 9,
             server_stream_repair: Arc::new(AtomicBool::new(false)),
@@ -1400,6 +1413,9 @@ async fn windows_client_reaches_wsl_server_through_a_real_turn_channel_and_dispa
             ready_tx: Some(ready_tx),
             allocation_started: None,
             allocation_ready: None,
+            target_workers: None,
+            scale_notify: None,
+            configured_workers: 1,
         },
     ));
 
@@ -1481,6 +1497,8 @@ async fn running_client_receives_hot_dns_configuration_without_reconnect() {
             salt: Arc::from("e2e-windows-generation"),
             mode: ObfsMode::Audio,
             wrap_key: derive_wrap_key(&password).unwrap(),
+            srtp_mode: SrtpMode::Wrap,
+            client_wrap_key: [0; 32],
             get_config: true,
             desired_count: 1,
             server_stream_repair: Arc::new(AtomicBool::new(false)),
@@ -1506,6 +1524,9 @@ async fn running_client_receives_hot_dns_configuration_without_reconnect() {
             ready_tx: Some(ready_tx),
             allocation_started: None,
             allocation_ready: None,
+            target_workers: None,
+            scale_notify: None,
+            configured_workers: 1,
         },
     ));
 
@@ -1661,6 +1682,8 @@ async fn nine_windows_workers_register_with_a_wsl_server_without_missing_or_dupl
                 salt: Arc::from("e2e-windows-generation"),
                 mode: ObfsMode::Audio,
                 wrap_key,
+                srtp_mode: SrtpMode::Wrap,
+                client_wrap_key: [0; 32],
                 get_config,
                 desired_count: WORKERS,
                 server_stream_repair: server_stream_repair.clone(),
@@ -1686,6 +1709,9 @@ async fn nine_windows_workers_register_with_a_wsl_server_without_missing_or_dupl
                 ready_tx: Some(ready_tx),
                 allocation_started: None,
                 allocation_ready: None,
+                target_workers: None,
+                scale_notify: None,
+                configured_workers: WORKERS,
             },
         )));
     }
@@ -2011,6 +2037,8 @@ async fn seventy_two_linux_workers_hold_per_stream_rate_through_server_dataplane
                 salt: Arc::from("e2e-wsl-throughput-generation"),
                 mode: ObfsMode::Audio,
                 wrap_key,
+                srtp_mode: SrtpMode::Wrap,
+                client_wrap_key: [0; 32],
                 get_config,
                 desired_count: WORKERS,
                 server_stream_repair: server_stream_repair.clone(),
@@ -2036,6 +2064,9 @@ async fn seventy_two_linux_workers_hold_per_stream_rate_through_server_dataplane
                 ready_tx: Some(ready_tx),
                 allocation_started: None,
                 allocation_ready: None,
+                target_workers: None,
+                scale_notify: None,
+                configured_workers: WORKERS,
             },
         )));
     }

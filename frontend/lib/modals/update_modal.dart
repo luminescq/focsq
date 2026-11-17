@@ -1,6 +1,8 @@
 ﻿// SPDX-FileCopyrightText: 2026 luminescq
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 import 'package:flutter/material.dart';
+
+import '../l10n/app_locale.dart';
 import '../service/update.dart';
 import '../theme/app_colors.dart';
 import 'profile_form_components.dart';
@@ -50,7 +52,7 @@ class UpdateModal extends StatelessWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            const ModalTopBar(title: 'Доступно обновление'),
+            ModalTopBar(title: S.updateAvailable),
             const SizedBox(height: 8),
             Container(
               width: double.infinity,
@@ -64,13 +66,13 @@ class UpdateModal extends StatelessWidget {
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const SectionDivider(text: 'Версия'),
+                  SectionDivider(text: S.version),
                   const SizedBox(height: 16),
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      const Text(
-                        'Установлена',
+                      Text(
+                        S.installed,
                         style: TextStyle(
                           color: AppColors.textSecondary,
                           fontSize: 12,
@@ -91,8 +93,8 @@ class UpdateModal extends StatelessWidget {
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      const Text(
-                        'Доступна',
+                      Text(
+                        S.available,
                         style: TextStyle(
                           color: AppColors.textSecondary,
                           fontSize: 12,
@@ -111,7 +113,7 @@ class UpdateModal extends StatelessWidget {
                   ),
                   if (update.notes.isNotEmpty) ...[
                     const SizedBox(height: 16),
-                    const SectionDivider(text: 'Список изменений'),
+                    SectionDivider(text: S.changelog),
                     const SizedBox(height: 12),
                     Container(
                       width: double.infinity,
@@ -150,8 +152,8 @@ class UpdateModal extends StatelessWidget {
                           borderRadius: BorderRadius.circular(10),
                         ),
                       ),
-                      child: const Text(
-                        'Скачать на странице релизов',
+                      child: Text(
+                        S.downloadReleases,
                         style: TextStyle(
                           fontSize: 14,
                           fontWeight: FontWeight.w800,
@@ -172,8 +174,8 @@ class UpdateModal extends StatelessWidget {
                           borderRadius: BorderRadius.circular(10),
                         ),
                       ),
-                      child: const Text(
-                        'Не напоминать про эту версию',
+                      child: Text(
+                        S.skipVersion,
                         style: TextStyle(
                           fontSize: 12,
                           fontWeight: FontWeight.w700,

@@ -1,5 +1,8 @@
 ﻿// SPDX-FileCopyrightText: 2026 luminescq
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+import 'dart:math' as math;
+import 'dart:ui' as ui show Canvas, Image, PictureRecorder;
+
 import 'package:flutter/material.dart';
 import '../service/connect.dart';
 import '../theme/app_colors.dart';
@@ -19,6 +22,14 @@ class _ConnectButtonState extends State<ConnectButton>
   late AnimationController _rotationController;
   late AnimationController _pulseController;
   late Animation<double> _scaleAnimation;
+  late final Listenable _animations;
+
+  // [FOCSQ] Путь бейджа запекается в текстуру один раз (как пятна фона):
+  // пульс масштабирует Image-слой с билинейной выборкой. Векторный путь на
+  // дробных масштабах каждый кадр проходил пере-rasterization с пересчётом
+  // антиалиасинговых краёв — они «кипели», шейп дрожал при подключении.
+  ui.Image? _badgeImage;
+  int _badgePx = 0;
 
   @override
   void initState() {
@@ -32,6 +43,8 @@ class _ConnectButtonState extends State<ConnectButton>
       vsync: this,
       duration: const Duration(milliseconds: 1500),
     );
+
+    _animations = Listenable.merge([_rotationController, _pulseController]);
 
     _scaleAnimation = TweenSequence<double>([
       TweenSequenceItem(
@@ -51,6 +64,26 @@ class _ConnectButtonState extends State<ConnectButton>
     ]).animate(_pulseController);
 
     _updateAnimations();
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _ensureBadgeTexture(MediaQuery.devicePixelRatioOf(context));
+  }
+
+  void _ensureBadgeTexture(double dpr) {
+    final px = (140 * dpr).ceil();
+    if (_badgeImage != null && _badgePx == px) return;
+    _badgeImage?.dispose();
+    final recorder = ui.PictureRecorder();
+    final canvas = ui.Canvas(recorder, Offset.zero & const Size(140, 140));
+    canvas.scale(dpr);
+    BadgePainter(color: AppColors.card).paint(canvas, const Size(140, 140));
+    final picture = recorder.endRecording();
+    _badgeImage = picture.toImageSync(px, px);
+    picture.dispose();
+    _badgePx = px;
   }
 
   @override
@@ -83,83 +116,95 @@ class _ConnectButtonState extends State<ConnectButton>
   void dispose() {
     _rotationController.dispose();
     _pulseController.dispose();
+    _badgeImage?.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
+    final image = _badgeImage;
     return GestureDetector(
       onTap: widget.onTap,
-      child: AnimatedBuilder(
-        animation: Listenable.merge([_rotationController, _pulseController]),
-        builder: (context, child) {
-          final scale = widget.state == ConnectState.connected
-              ? _scaleAnimation.value
-              : 1.0;
-          final rotation = _rotationController.value * 2 * 3.14159265359;
-          final color = AppColors.card;
-
-          return Stack(
-            alignment: Alignment.center,
-            children: [
-              RepaintBoundary(
-                child: Transform.scale(
-                  scale: scale,
-                  child: Transform.rotate(
-                    angle: rotation,
-                    child: CustomPaint(
-                      painter: BadgePainter(color: color),
+      child: Stack(
+        alignment: Alignment.center,
+        children: [
+          AnimatedBuilder(
+            animation: _animations,
+            child: RepaintBoundary(
+              child: image != null
+                  ? CustomPaint(
+                      painter: _BadgeTexturePainter(image),
+                      child: const SizedBox(width: 140, height: 140),
+                    )
+                  : CustomPaint(
+                      painter: BadgePainter(color: AppColors.card),
                       child: const SizedBox(width: 140, height: 140),
                     ),
+            ),
+            builder: (context, child) {
+              final scale = widget.state == ConnectState.connected
+                  ? _scaleAnimation.value
+                  : 1.0;
+              final rotation = _rotationController.value * 2 * math.pi;
+
+              return Transform.scale(
+                scale: scale,
+                child: Transform.rotate(angle: rotation, child: child),
+              );
+            },
+          ),
+          AnimatedSwitcher(
+            duration: const Duration(milliseconds: 300),
+            child: widget.state == ConnectState.connected
+                ? const Icon(
+                    Icons.stop_rounded,
+                    key: ValueKey('stop'),
+                    color: AppColors.textPrimary,
+                    size: 56,
+                  )
+                : const Icon(
+                    Icons.play_arrow_rounded,
+                    key: ValueKey('play'),
+                    color: AppColors.textPrimary,
+                    size: 64,
                   ),
-                ),
-              ),
-              AnimatedSwitcher(
-                duration: const Duration(milliseconds: 300),
-                child: widget.state == ConnectState.connected
-                    ? const Icon(
-                        Icons.stop_rounded,
-                        key: ValueKey('stop'),
-                        color: AppColors.textPrimary,
-                        size: 56,
-                      )
-                    : const Icon(
-                        Icons.play_arrow_rounded,
-                        key: ValueKey('play'),
-                        color: AppColors.textPrimary,
-                        size: 64,
-                      ),
-              ),
-            ],
-          );
-        },
+          ),
+        ],
       ),
     );
   }
+}
+
+/// Бейдж, запечённый в текстуру: пульс масштабирует стабильный Image
+/// (билинейная выборка), векторный путь не перерasterизуется на кадр.
+class _BadgeTexturePainter extends CustomPainter {
+  _BadgeTexturePainter(this._image);
+
+  final ui.Image _image;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    canvas.drawImageRect(
+      _image,
+      Rect.fromLTWH(0, 0, _image.width.toDouble(), _image.height.toDouble()),
+      Offset.zero & size,
+      Paint()..filterQuality = FilterQuality.medium,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _BadgeTexturePainter oldDelegate) =>
+      oldDelegate._image != _image;
 }
 
 class BadgePainter extends CustomPainter {
   final Color color;
   BadgePainter({required this.color});
 
-  @override
-  void paint(Canvas canvas, Size size) {
-    const double designWidth = 189.36;
-    const double designHeight = 187.52;
+  // Геометрия значка постоянна — строим Path один раз на процесс.
+  static final Path _path = _buildPath();
 
-    final double scaleX = size.width / designWidth;
-    final double scaleY = size.height / designHeight;
-    final double scale = scaleX < scaleY ? scaleX : scaleY;
-
-    final double dx = (size.width - designWidth * scale) / 2;
-    final double dy = (size.height - designHeight * scale) / 2;
-
-    canvas.translate(dx, dy);
-    canvas.scale(scale, scale);
-
-    canvas.save();
-    canvas.translate(2.44, 1.52);
-
+  static Path _buildPath() {
     final path = Path();
     path.moveTo(83.68, 4.56);
     path.cubicTo(87.62, -1.52, 96.86, -1.52, 100.80, 4.56);
@@ -202,12 +247,32 @@ class BadgePainter extends CustomPainter {
     path.lineTo(61.86, 22.96);
     path.cubicTo(66.42, 24.74, 71.64, 23.11, 74.23, 19.12);
     path.close();
+    return path;
+  }
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    const double designWidth = 189.36;
+    const double designHeight = 187.52;
+
+    final double scaleX = size.width / designWidth;
+    final double scaleY = size.height / designHeight;
+    final double scale = scaleX < scaleY ? scaleX : scaleY;
+
+    final double dx = (size.width - designWidth * scale) / 2;
+    final double dy = (size.height - designHeight * scale) / 2;
+
+    canvas.translate(dx, dy);
+    canvas.scale(scale, scale);
+
+    canvas.save();
+    canvas.translate(2.44, 1.52);
 
     final paint = Paint()
       ..style = PaintingStyle.fill
       ..color = color
       ..isAntiAlias = true;
-    canvas.drawPath(path, paint);
+    canvas.drawPath(_path, paint);
     canvas.restore();
   }
 

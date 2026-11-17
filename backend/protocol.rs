@@ -1,19 +1,36 @@
 // SPDX-FileCopyrightText: 2026 amurcanov
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
-use anyhow::{Result, bail};
+use anyhow::{Error, Result, bail};
 
 use crate::wire_protocol::WIRE_PROTOCOL_REVISION;
 
 pub const PANEL_RESTART_NOTICE: &[u8] = b"\xffCSQTT_PANEL_RESTART_V1\x00\x91\x7d\x03\xa8";
 pub const STREAM_REPAIR_PREFIX: &[u8] = b"\xffCSQTT_STREAM_REPAIR_V1";
 pub const STREAM_ALIVE_PREFIX: &[u8] = b"\xffCSQTT_STREAM_ALIVE_V1";
-const MAX_STREAM_WORKERS: u16 = 126;
+const MAX_STREAM_WORKERS: u16 = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigResponse {
     Config(String),
     NoConfig,
+}
+
+/// Сервер отклонил запрошенное количество потоков. Не является ошибкой
+/// авторизации, поэтому обрабатывается отдельно от `FATAL_AUTH`/`FATAL_PROTOCOL`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerLimitRejected;
+
+impl std::fmt::Display for WorkerLimitRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("превышен лимит потоков сервера (invalid_worker_count)")
+    }
+}
+
+impl std::error::Error for WorkerLimitRejected {}
+
+pub fn is_worker_limit_error(error: &Error) -> bool {
+    error.downcast_ref::<WorkerLimitRejected>().is_some()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,7 +67,8 @@ pub fn parse_config_response(response: &[u8]) -> Result<ConfigResponse> {
             "device_mismatch" => {
                 bail!("FATAL_AUTH: пароль привязан к другому устройству")
             }
-            "protocol_mismatch" | "invalid_worker_count" => bail!(
+            "invalid_worker_count" => return Err(Error::new(WorkerLimitRejected)),
+            "protocol_mismatch" => bail!(
                 "FATAL_PROTOCOL: клиент и сервер используют разные версии протокола; выполните деплой из этой версии приложения"
             ),
             _ => bail!("FATAL_AUTH: доступ запрещён ({reason})"),
@@ -82,6 +100,10 @@ pub fn is_control_response(response: &[u8]) -> bool {
         b"DENIED:".as_slice(),
         b"READY_OK".as_slice(),
         b"OK:disconnected".as_slice(),
+        b"ROUTING:".as_slice(),
+        b"TUNWORKERS:".as_slice(),
+        b"WORKERS:".as_slice(),
+        crate::wire_protocol::PATH_ECHO_PREFIX,
         STREAM_REPAIR_PREFIX,
         STREAM_ALIVE_PREFIX,
     ]
@@ -89,12 +111,34 @@ pub fn is_control_response(response: &[u8]) -> bool {
     .any(|prefix| response.starts_with(prefix))
 }
 
+pub fn workers_request(password: &str, desired_count: usize) -> String {
+    format!("GETWORKERS:{password}|{desired_count}")
+}
+
+pub fn parse_tunworkers_response(payload: &[u8]) -> Option<(usize, usize)> {
+    let text = std::str::from_utf8(payload).ok()?;
+    if let Some(rest) = text.strip_prefix("TUNWORKERS:") {
+        let mut parts = rest.split(':');
+        let agreed = parts.next()?.trim().parse::<usize>().ok()?;
+        let server_limit = parts
+            .next()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        return Some((agreed, server_limit));
+    }
+    if let Some(rest) = text.strip_prefix("WORKERS:") {
+        let limit = rest.trim().parse::<usize>().ok()?;
+        return Some((limit, limit));
+    }
+    None
+}
+
 pub fn is_panel_restart_notice(response: &[u8]) -> bool {
     response == PANEL_RESTART_NOTICE
 }
 
-pub fn disconnect_request(device_id: &str, salt: &str) -> String {
-    format!("DISCONNECT:{device_id}|{salt}")
+pub fn disconnect_request(password: &str, salt: &str) -> String {
+    format!("DISCONNECT:{password}|{salt}")
 }
 
 pub fn parse_stream_repair(payload: &[u8]) -> Option<StreamRepairCommand> {
@@ -180,6 +224,10 @@ mod tests {
             b"DENIED:expired".as_slice(),
             b"READY_OK".as_slice(),
             b"OK:disconnected".as_slice(),
+            b"ROUTING:START:1".as_slice(),
+            b"TUNWORKERS:20:20".as_slice(),
+            b"WORKERS:20".as_slice(),
+            crate::wire_protocol::PATH_ECHO_PREFIX,
             PANEL_RESTART_NOTICE,
             STREAM_REPAIR_PREFIX,
             STREAM_ALIVE_PREFIX,
@@ -243,7 +291,7 @@ mod tests {
     }
 
     #[test]
-    fn every_denied_reason_is_fatal() {
+    fn auth_denied_reasons_are_fatal() {
         for response in [
             b"DENIED:wrong_password".as_slice(),
             b"DENIED:expired".as_slice(),
@@ -257,5 +305,13 @@ mod tests {
                     .contains("FATAL_AUTH")
             );
         }
+    }
+
+    #[test]
+    fn worker_limit_rejection_is_classified_separately() {
+        let error = parse_config_response(b"DENIED:invalid_worker_count").unwrap_err();
+        assert!(is_worker_limit_error(&error));
+        assert!(!error.to_string().contains("FATAL_"));
+        assert!(error.to_string().contains("лимит потоков"));
     }
 }

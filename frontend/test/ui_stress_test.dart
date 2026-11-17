@@ -68,31 +68,34 @@ void main() {
   // =========================================================================
 
   group('LogService — шторм логов', () {
-    test('20 000 строк одним куском: буфер обрезан, ОДНО уведомление', () async {
-      var notifications = 0;
-      LogService().addListener(() => notifications++);
+    test(
+      '20 000 строк одним куском: буфер обрезан, ОДНО уведомление',
+      () async {
+        var notifications = 0;
+        LogService().addListener(() => notifications++);
 
-      final sw = Stopwatch()..start();
-      for (var i = 0; i < 20000; i++) {
-        LogService().add('[КОННЕКТ] шторм $i');
-      }
-      sw.stop();
+        final sw = Stopwatch()..start();
+        for (var i = 0; i < 20000; i++) {
+          LogService().add('[КОННЕКТ] шторм $i');
+        }
+        sw.stop();
 
-      // Кольцевой буфер вытеснил самое старое, хвост на месте.
-      expect(LogService().lines.length, LogService.maxLines);
-      expect(LogService().lines.first, contains('шторм 18000'));
-      expect(LogService().lines.last, contains('шторм 19999'));
+        // Кольцевой буфер вытеснил самое старое, хвост на месте.
+        expect(LogService().lines.length, LogService.maxLines);
+        expect(LogService().lines.first, contains('шторм 18000'));
+        expect(LogService().lines.last, contains('шторм 19999'));
 
-      // Коалесинг: весь синхронный шторм = один вызов слушателей.
-      await Future<void>.delayed(const Duration(milliseconds: 100));
-      expect(notifications, 1);
-      expect(notifications, lessThan(20000));
+        // Коалесинг: весь синхронный шторм = один вызов слушателей.
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+        expect(notifications, 1);
+        expect(notifications, lessThan(20000));
 
-      // Шторм не должен занимать заметного времени.
-      expect(sw.elapsedMilliseconds, lessThan(3000));
+        // Шторм не должен занимать заметного времени.
+        expect(sw.elapsedMilliseconds, lessThan(3000));
 
-      LogService().removeListener(() {});
-    });
+        LogService().removeListener(() {});
+      },
+    );
 
     test('пачки с паузами: уведомлений сильно меньше, чем строк', () async {
       var notifications = 0;
@@ -126,16 +129,20 @@ void main() {
       await tester.pumpAndSettle();
     }
 
-    testWidgets('200 показов в один кадр — жив только последний', (tester) async {
+    testWidgets('200 показов в один кадр — жив только последний', (
+      tester,
+    ) async {
       BuildContext? alertContext;
-      await tester.pumpWidget(MaterialApp(
-        home: Builder(
-          builder: (context) {
-            alertContext = context;
-            return const SizedBox();
-          },
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Builder(
+            builder: (context) {
+              alertContext = context;
+              return const SizedBox();
+            },
+          ),
         ),
-      ));
+      );
 
       for (var i = 0; i < 200; i++) {
         CustomAlert.show(
@@ -158,14 +165,16 @@ void main() {
 
     testWidgets('чередование показов и таймеров автоскрытия', (tester) async {
       BuildContext? alertContext;
-      await tester.pumpWidget(MaterialApp(
-        home: Builder(
-          builder: (context) {
-            alertContext = context;
-            return const SizedBox();
-          },
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Builder(
+            builder: (context) {
+              alertContext = context;
+              return const SizedBox();
+            },
+          ),
         ),
-      ));
+      );
       // Каждые 300мс новый алерт — предыдущий обязан сниматься мгновенно,
       // даже когда их уже начал прятать 4-секундный таймер.
       for (var i = 0; i < 30; i++) {
@@ -185,17 +194,20 @@ void main() {
       expect(find.text('волна 29'), findsNothing);
     });
 
-    testWidgets('закрыть крестиком и сразу показать новый во время анимации',
-        (tester) async {
+    testWidgets('закрыть крестиком и сразу показать новый во время анимации', (
+      tester,
+    ) async {
       BuildContext? alertContext;
-      await tester.pumpWidget(MaterialApp(
-        home: Builder(
-          builder: (context) {
-            alertContext = context;
-            return const SizedBox();
-          },
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Builder(
+            builder: (context) {
+              alertContext = context;
+              return const SizedBox();
+            },
+          ),
         ),
-      ));
+      );
 
       // Самый жёсткий сценарий: тап по крестику запускает reverse-анимацию
       // (350мс), и не дожидаясь её конца показываем следующий алерт —
@@ -265,8 +277,9 @@ void main() {
       expect(LogService().lines.last, contains('событие 49-99'));
     });
 
-    testWidgets('30 пересозданий экрана: поиск пережил, слушатели не текут',
-        (tester) async {
+    testWidgets('30 пересозданий экрана: поиск пережил, слушатели не текут', (
+      tester,
+    ) async {
       await pumpLogs(tester);
 
       // Переключение вкладок пересоздаёт экран целиком (AnimatedSwitcher).
@@ -274,10 +287,12 @@ void main() {
       await tester.pumpAndSettle();
 
       for (var i = 0; i < 30; i++) {
-        await tester
-            .pumpWidget(const MaterialApp(home: Scaffold(body: SizedBox())));
-        await tester
-            .pumpWidget(const MaterialApp(home: Scaffold(body: LogsScreen())));
+        await tester.pumpWidget(
+          const MaterialApp(home: Scaffold(body: SizedBox())),
+        );
+        await tester.pumpWidget(
+          const MaterialApp(home: Scaffold(body: LogsScreen())),
+        );
         await tester.pump();
       }
       await tester.pumpAndSettle();
@@ -293,8 +308,9 @@ void main() {
       expect(find.text('TURN жив'), findsOneWidget);
     });
 
-    testWidgets('молниеносный набор поиска без пауз между кадрами',
-        (tester) async {
+    testWidgets('молниеносный набор поиска без пауз между кадрами', (
+      tester,
+    ) async {
       await pumpLogs(tester);
       LogService().add('[КОННЕКТ] TURN аллокация');
       LogService().add('[КОННЕКТ] обычное сообщение');
@@ -303,8 +319,17 @@ void main() {
 
       // Каждый символ — новая перестройка тулбара и панели; settle не ждём.
       const queries = [
-        'т', 'tur', 'turn', 'turn ', 'turn а', 'turn ал', 'turn алл',
-        'turn алло', 'turn аллок', 'turn аллокац', 'turn аллокация',
+        'т',
+        'tur',
+        'turn',
+        'turn ',
+        'turn а',
+        'turn ал',
+        'turn алл',
+        'turn алло',
+        'turn аллок',
+        'turn аллокац',
+        'turn аллокация',
       ];
       for (final q in queries) {
         await tester.enterText(find.byType(TextField), q);
@@ -325,26 +350,28 @@ void main() {
       expect(find.text('обычное сообщение'), findsOneWidget);
     });
 
-    testWidgets('два экрана логов живы одновременно — у каждого свои контроллеры',
-        (tester) async {
-      // Переход вкладок в AnimatedSwitcher 500мс держит старый и новый
-      // экран живыми вместе. Если бы контроллеры были static, оба ListView
-      // повисли бы на одном ScrollController — это запрещено и в дебаге
-      // падает ассертом. Прогоняем худший случай напрямую.
-      await tester.pumpWidget(const MaterialApp(
-        home: Scaffold(
-          body: Stack(children: [LogsScreen(), LogsScreen()]),
-        ),
-      ));
-      await tester.pumpAndSettle();
+    testWidgets(
+      'два экрана логов живы одновременно — у каждого свои контроллеры',
+      (tester) async {
+        // Переход вкладок в AnimatedSwitcher 500мс держит старый и новый
+        // экран живыми вместе. Если бы контроллеры были static, оба ListView
+        // повисли бы на одном ScrollController — это запрещено и в дебаге
+        // падает ассертом. Прогоняем худший случай напрямую.
+        await tester.pumpWidget(
+          const MaterialApp(
+            home: Scaffold(body: Stack(children: [LogsScreen(), LogsScreen()])),
+          ),
+        );
+        await tester.pumpAndSettle();
 
-      LogService().add('[КОННЕКТ] два экрана');
-      await tester.pumpAndSettle();
-      expect(find.text('два экрана'), findsNWidgets(2));
+        LogService().add('[КОННЕКТ] два экрана');
+        await tester.pumpAndSettle();
+        expect(find.text('два экрана'), findsNWidgets(2));
 
-      final fields = tester.widgetList<TextField>(find.byType(TextField));
-      expect(fields, hasLength(2));
-      expect(fields.first.controller, isNot(same(fields.last.controller)));
-    });
+        final fields = tester.widgetList<TextField>(find.byType(TextField));
+        expect(fields, hasLength(2));
+        expect(fields.first.controller, isNot(same(fields.last.controller)));
+      },
+    );
   });
 }

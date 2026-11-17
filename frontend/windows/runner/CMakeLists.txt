@@ -7,6 +7,7 @@ project(runner LANGUAGES CXX)
 #
 # Any new source files that you add to the application should be added here.
 add_executable(${BINARY_NAME} WIN32
+  "deep_link.cpp"
   "flutter_window.cpp"
   "main.cpp"
   "utils.cpp"
@@ -15,6 +16,14 @@ add_executable(${BINARY_NAME} WIN32
   "Runner.rc"
   "runner.exe.manifest"
 )
+
+# Лёгкий asInvoker-лаунчер для ярлыков: ярлыки запускают focsq_stub.exe,
+# который фокусирует уже запущенное окно БЕЗ UAC или запускает focsq.exe
+# (UAC один раз). Манифест по умолчанию — asInvoker, flutter-зависимостей нет.
+add_executable(focsq_stub WIN32 "launcher_stub.cpp")
+target_compile_definitions(focsq_stub PRIVATE "_UNICODE" "UNICODE")
+target_compile_features(focsq_stub PRIVATE cxx_std_17)
+target_link_libraries(focsq_stub PRIVATE user32.lib shell32.lib)
 
 # Apply the standard set of build settings. This can be removed for applications
 # that need different build settings.
@@ -38,7 +47,8 @@ target_compile_definitions(${BINARY_NAME} PRIVATE "NOMINMAX")
 # Add dependency libraries and include directories. Add any application-specific
 # dependencies here.
 target_link_libraries(${BINARY_NAME} PRIVATE flutter flutter_wrapper_app)
-target_link_libraries(${BINARY_NAME} PRIVATE "dwmapi.lib")
+target_link_libraries(${BINARY_NAME} PRIVATE "dwmapi.lib" "shell32.lib"
+                                            "advapi32.lib")
 target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}")
 
 # Run the Flutter tool portions of the build. This must not be removed.

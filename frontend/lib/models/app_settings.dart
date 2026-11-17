@@ -34,7 +34,30 @@ class AppSettings {
 
   bool developerMode = false;
 
+  bool banDisclaimerAccepted = false;
+
+  // Префикс z держит поле последним в алфавитном порядке: Isar присваивает
+  // property id по порядку имён, и вставка в середину сдвигает id остальных
+  // свойств, ломая миграцию уже существующих баз (isar#1460).
+  bool zAllowInsecureHttp = false;
+
   String? skipUpdateVersion;
+
+  bool zDomainRouting = false;
+
+  bool zExcludeRuZones = false;
+
+  bool zTemplateDomains = false;
+
+  bool zDomainWhitelist = false;
+
+  String zDirectDomains = '';
+
+  bool zIpRouting = false;
+
+  bool zIpWhitelist = false;
+
+  String zDirectIps = '';
 }
 
 String generateDeviceId() {

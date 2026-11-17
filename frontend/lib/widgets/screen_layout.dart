@@ -1,4 +1,4 @@
-﻿// SPDX-FileCopyrightText: 2026 luminescq
+// SPDX-FileCopyrightText: 2026 luminescq
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 import 'package:flutter/material.dart';
 
@@ -39,10 +39,7 @@ class ScreenLayout extends StatelessWidget {
                   const SizedBox(width: 20),
                 ],
                 Text(title, style: AppTextStyles.screenTitle),
-                if (actions.isNotEmpty) ...[
-                  const Spacer(),
-                  ...actions,
-                ],
+                if (actions.isNotEmpty) ...[const Spacer(), ...actions],
               ],
             ),
           ),

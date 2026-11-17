@@ -1,4 +1,4 @@
-﻿// SPDX-FileCopyrightText: 2026 amurcanov
+// SPDX-FileCopyrightText: 2026 amurcanov
 // SPDX-FileCopyrightText: 2026 luminescq
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
@@ -24,7 +24,6 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
-use windows_sys::core::GUID;
 use windows_sys::Win32::{
     Foundation::{ERROR_OBJECT_ALREADY_EXISTS, NO_ERROR},
     NetworkManagement::{
@@ -39,6 +38,7 @@ use windows_sys::Win32::{
         AF_INET, IpDadStatePreferred, IpPrefixOriginManual, IpSuffixOriginManual,
     },
 };
+use windows_sys::core::GUID;
 
 const ADAPTER_NAME: &str = "csqtt";
 /// Фиксированный GUID (как WintunStaticRequestedGUID в PWDTT/WireGuard):
@@ -91,7 +91,9 @@ impl WinTunDevice {
             format!("не удалось загрузить {dll_path:?} (нужен wintun.dll с wintun.net)")
         })?;
         let adapter = wintun::Adapter::create(&wintun, ADAPTER_NAME, "CSQTT", Some(ADAPTER_GUID))
-            .context("не удалось создать wintun-адаптер (запустите приложение от администратора)")?;
+            .context(
+            "не удалось создать wintun-адаптер (запустите приложение от администратора)",
+        )?;
         let session = Arc::new(
             adapter
                 .start_session(wintun::MAX_RING_CAPACITY)
@@ -122,6 +124,16 @@ impl WinTunDevice {
     pub fn receive_blocking(&self) -> std::io::Result<Vec<u8>> {
         let packet = self.session.receive_blocking()?;
         Ok(packet.bytes().to_vec())
+    }
+
+    /// [FOCSQ] Неблокирующее чтение: Ok(None), когда в ring пусто.
+    /// Для батчинга аплинка: после первого блокирующего чтения вычитываем
+    /// всё накопившееся без новых блокирующих системных вызовов.
+    pub fn try_receive(&self) -> std::io::Result<Option<Vec<u8>>> {
+        Ok(self
+            .session
+            .try_receive()?
+            .map(|packet| packet.bytes().to_vec()))
     }
 
     /// Отправка IP-пакета в адаптер
@@ -171,7 +183,10 @@ fn resolve_dll() -> Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("нет папки у исполняемого файла"))?
         .join("wintun.dll");
     if !path.exists() {
-        bail!("wintun.dll не найден рядом с приложением ({})", path.display());
+        bail!(
+            "wintun.dll не найден рядом с приложением ({})",
+            path.display()
+        );
     }
     Ok(path)
 }
@@ -290,11 +305,7 @@ mod hidden_process {
 
     /// Экранирование аргумента по правилам CommandLineToArgvW (как у std).
     fn quote_arg(arg: &str) -> String {
-        if !arg.is_empty()
-            && !arg
-                .bytes()
-                .any(|b| b == b' ' || b == b'"' || b == b'\t')
-        {
+        if !arg.is_empty() && !arg.bytes().any(|b| b == b' ' || b == b'"' || b == b'\t') {
             return arg.to_owned();
         }
         let mut out = String::with_capacity(arg.len() + 2);
@@ -336,7 +347,15 @@ mod hidden_process {
         let mut buf = [0u8; 4096];
         loop {
             let mut read: DWORD = 0;
-            let ok = unsafe { ReadFile(handle, buf.as_mut_ptr(), buf.len() as DWORD, &mut read, std::ptr::null_mut()) };
+            let ok = unsafe {
+                ReadFile(
+                    handle,
+                    buf.as_mut_ptr(),
+                    buf.len() as DWORD,
+                    &mut read,
+                    std::ptr::null_mut(),
+                )
+            };
             if ok == 0 || read == 0 {
                 break;
             }
@@ -405,7 +424,11 @@ mod hidden_process {
             w_show_window: SW_HIDE,
             cb_reserved2: 0,
             lp_reserved2: std::ptr::null_mut(),
-            h_std_input: if stdin_nul == INVALID_HANDLE_VALUE { 0 } else { stdin_nul },
+            h_std_input: if stdin_nul == INVALID_HANDLE_VALUE {
+                0
+            } else {
+                stdin_nul
+            },
             h_std_output: out_w,
             h_std_error: err_w,
         };
@@ -571,8 +594,7 @@ fn exclude_via_gateway(
     gateway: &str,
     interface: &str,
 ) -> Vec<String> {
-    let on_link =
-        gateway == ON_LINK_GATEWAY || gateway.eq_ignore_ascii_case("on-link");
+    let on_link = gateway == ON_LINK_GATEWAY || gateway.eq_ignore_ascii_case("on-link");
     let mut args = vec![
         "add".to_owned(),
         destination.to_owned(),
@@ -589,12 +611,7 @@ fn exclude_via_gateway(
 }
 
 /// Добавить exclude-маршрут через исходный шлюз; при ошибке — лог и false
-fn add_exclude_route(
-    destination: &str,
-    gateway: &str,
-    interface: &str,
-    what: &str,
-) -> bool {
+fn add_exclude_route(destination: &str, gateway: &str, interface: &str, what: &str) -> bool {
     match run_route_owned(&exclude_via_gateway(
         destination,
         HOST_MASK,
@@ -638,28 +655,22 @@ fn system_dns_servers() -> Vec<String> {
     }
     for guid in guids {
         // Сопоставляем GUID → имя адаптера, чтобы исключить наш 'csqtt'
-        let connection_key =
-            format!(r"{NETWORK_CLASS}\{guid}\Connection");
+        let connection_key = format!(r"{NETWORK_CLASS}\{guid}\Connection");
         let is_ours = run_cmd("reg", &["query", &connection_key, "/v", "Name"])
-            .map(|output| {
-                output
-                    .lines()
-                    .any(|line| line.contains(ADAPTER_NAME))
-            })
+            .map(|output| output.lines().any(|line| line.contains(ADAPTER_NAME)))
             .unwrap_or(false);
         if is_ours {
             continue;
         }
         let interface_key = format!(r"{TCPIP_IFACES}\{guid}");
         for value_name in ["DhcpNameServer", "NameServer"] {
-            let Ok(value) = run_cmd(
-                "reg",
-                &["query", &interface_key, "/v", value_name],
-            ) else {
+            let Ok(value) = run_cmd("reg", &["query", &interface_key, "/v", value_name]) else {
                 continue;
             };
             for line in value.lines() {
-                let Some(pos) = line.find("REG_") else { continue };
+                let Some(pos) = line.find("REG_") else {
+                    continue;
+                };
                 for token in line[pos..].split_whitespace().skip(1) {
                     if token.parse::<Ipv4Addr>().is_ok() && token != "0.0.0.0" {
                         result.push(token.to_owned());
@@ -671,9 +682,7 @@ fn system_dns_servers() -> Vec<String> {
     result.sort();
     result.dedup();
     if result.is_empty() {
-        crate::log_error!(
-            "[TUN] Системные DNS не обнаружены — проверь маршруты до роутера"
-        );
+        crate::log_error!("[TUN] Системные DNS не обнаружены — проверь маршруты до роутера");
     }
     result
 }
@@ -850,7 +859,10 @@ fn verify_half_routes(gateway_tun: Ipv4Addr) -> Result<()> {
     for destination in HALF_NETS {
         let present = output.lines().any(|line| {
             let tokens: Vec<&str> = line.split_whitespace().collect();
-            tokens.len() >= 5 && tokens[0] == destination && tokens[1] == HALF_MASK && tokens[2] == gateway
+            tokens.len() >= 5
+                && tokens[0] == destination
+                && tokens[1] == HALF_MASK
+                && tokens[2] == gateway
         });
         if !present {
             bail!(
@@ -943,16 +955,11 @@ pub async fn apply_tunconf(ip: &str, dns: &str, peer_ip: &str) -> Result<()> {
         let Some((network, mask)) = parse_cidr(cidr) else {
             continue;
         };
-        match run_route_owned(&exclude_via_gateway(
-            &network,
-            &mask,
-            &gateway,
-            &interface,
-        )) {
+        match run_route_owned(&exclude_via_gateway(&network, &mask, &gateway, &interface)) {
             Ok(_) => cidr_cleanup.push(format!("{network} mask {mask}")),
-            Err(error) => crate::log_error!(
-                "[TUN] Exclude-подсеть VK {cidr} не добавлена: {error}"
-            ),
+            Err(error) => {
+                crate::log_error!("[TUN] Exclude-подсеть VK {cidr} не добавлена: {error}")
+            }
         }
     }
     // [FOCSQ] TURN-IP, увиденные до перехвата, исключаются немедленно
@@ -965,7 +972,44 @@ pub async fn apply_tunconf(ip: &str, dns: &str, peer_ip: &str) -> Result<()> {
     // (роутер/провайдер): приватные адреса из сети пира недостижимы, а
     // «сырые» прямые запросы отдельных приложений пусть не рвутся. Параллельные
     // запросы резолвера к ним подавляет NRPT-правило (см. set_nrpt_rule).
-    let mut dns_excludes = system_dns_servers();
+    // [FOCSQ] СОВПАДЕНИЕ системного DNS с DNS туннеля — не исключаем НИКОГДА:
+    // /32-исключение выводило резолвер NRPT из туннеля на прямой путь
+    // провайдера (DPI/блокировка UDP/53) — DNS умирал целиком, хотя сам
+    // туннель (пинг, IP-трафик) работал. На Android таких исключений нет,
+    // поэтому телефон работает там, где Windows терял резолв.
+    let system_dns = system_dns_servers();
+    let tunnel_dns: HashSet<Ipv4Addr> = dns_servers
+        .iter()
+        .filter_map(|server| server.parse::<Ipv4Addr>().ok())
+        .collect();
+    let overridden: Vec<&String> = system_dns
+        .iter()
+        .filter(|server| {
+            server
+                .parse::<Ipv4Addr>()
+                .is_ok_and(|ip| tunnel_dns.contains(&ip))
+        })
+        .collect();
+    if !overridden.is_empty() {
+        // Список собирается ДО макроса: guard-тест локализации склеивает все
+        // строковые литералы внутри log_error!, лишняя ", " ломала покрытие.
+        let list = overridden
+            .iter()
+            .map(|server| server.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        crate::log_error!(
+            "[TUN] Системный DNS {list} совпадает с DNS туннеля — уходит в туннель, /32-исключение не ставим"
+        );
+    }
+    let mut dns_excludes: Vec<String> = system_dns
+        .into_iter()
+        .filter(|server| {
+            server
+                .parse::<Ipv4Addr>()
+                .is_ok_and(|ip| !tunnel_dns.contains(&ip))
+        })
+        .collect();
     dns_excludes.sort();
     dns_excludes.dedup();
 
@@ -995,20 +1039,80 @@ pub async fn apply_tunconf(ip: &str, dns: &str, peer_ip: &str) -> Result<()> {
     drop(pending);
 
     // [FOCSQ] DNS на адаптер — последним шагом, когда ВСЕ exclude-маршруты
-    // уже стоят. Резолвер переключаем на TUNCONF-DNS (1.1.1.1): его трафик
-    // идёт через туннель (шаг 5), так что резолюция выполняется с выхода
-    // VPN-сервера. Окно флапа отсутствует — маршруты уже живые.
-    set_dns(luid_to_guid(luid)?, &dns_servers)?;
+    // уже стоят. Резолвер переключаем на TUNCONF-DNS: его трафик идёт через
+    // туннель (шаг 5), так что резолюция выполняется с выхода VPN-сервера.
+    // Окно флапа отсутствует — маршруты уже живые.
+    let guid = luid_to_guid(luid)?;
+    set_dns(guid, &dns_servers)?;
 
     // [FOCSQ] NRPT подавляет параллельные запросы к DNS физического
     // адаптера (роутер отвечает быстрее и перебивает туннельный ответ).
     set_nrpt_rule(&dns_servers[0]);
+
+    // [FOCSQ] TUNCONF-DNS может быть недостижим С СЕРВЕРА: 77.88.8.8 молчит
+    // с части хостеров/регионов, при этом 1.1.1.1 через тот же туннель
+    // отвечает — и резолв умирает целиком при живом туннеле (пинг ходит,
+    // nslookup таймаутит). Проверяем резолверы живым UDP-запросом через
+    // туннель и при полном молчании переключаем адаптер и NRPT на резервный.
+    const DNS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+    let fallback_dns = [Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(8, 8, 8, 8)];
+    if !dns_servers
+        .iter()
+        .filter_map(|server| server.parse::<Ipv4Addr>().ok())
+        .any(|server| probe_dns(server, DNS_PROBE_TIMEOUT))
+    {
+        match fallback_dns
+            .into_iter()
+            .find(|server| probe_dns(*server, DNS_PROBE_TIMEOUT))
+        {
+            Some(backup) => {
+                crate::log_error!(
+                    "[TUN] DNS туннеля {dns} не отвечает через туннель — переключаю резолвер на {backup}"
+                );
+                set_dns(guid, &[backup.to_string()])?;
+                set_nrpt_rule(&backup.to_string());
+            }
+            None => {
+                crate::log_error!(
+                    "[TUN] DNS туннеля {dns} и резервы 1.1.1.1/8.8.8.8 не отвечают — DNS через туннель недоступен (проверь сервер)"
+                );
+            }
+        }
+    }
 
     crate::log_error!(
         "[TUN] Настроен: ip={ip}/24 gw={gateway_tun} dns={dns} | исходный шлюз {gateway} (iface {interface}), пир {peer_ip} — через туннель, dns-exclude {} шт",
         dns_excludes.len()
     );
     Ok(())
+}
+
+/// [FOCSQ] Проверка резолвера через туннель: минимальный UDP A-запрос.
+/// Важен сам факт ответа (даже NXDOMAIN значит «сервер жив»), не содержимое.
+/// Маршрутизация уже применена — запрос уходит через TUN, как любой трафик.
+fn probe_dns(server: Ipv4Addr, timeout: Duration) -> bool {
+    let Ok(socket) = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) else {
+        return false;
+    };
+    if socket.set_read_timeout(Some(timeout)).is_err() {
+        return false;
+    }
+    // Заголовок: id, флаги RD=1, QDCOUNT=1; имя one.one.one.one; тип A, класс IN.
+    let mut query = Vec::with_capacity(32);
+    query.extend_from_slice(&[
+        0x1f, 0x2e, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ]);
+    for label in "one.one.one.one".split('.') {
+        query.push(label.len() as u8);
+        query.extend_from_slice(label.as_bytes());
+    }
+    query.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+    let destination = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(server, 53));
+    if socket.send_to(&query, destination).is_err() {
+        return false;
+    }
+    let mut buffer = [0u8; 512];
+    socket.recv_from(&mut buffer).is_ok()
 }
 
 /// [FOCSQ] NRPT-правило (Name Resolution Policy Table) на время сессии:
@@ -1027,13 +1131,13 @@ fn set_nrpt_rule(dns_server: &str) {
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            &format!(
-                "Add-DnsClientNrptRule -Namespace '.' -NameServers '{dns_server}'"
-            ),
+            &format!("Add-DnsClientNrptRule -Namespace '.' -NameServers '{dns_server}'"),
         ],
     ) {
         Ok(_) => {
-            crate::log_error!("[TUN] NRPT: системный резолвер направлен в {dns_server} (через туннель)")
+            crate::log_error!(
+                "[TUN] NRPT: системный резолвер направлен в {dns_server} (через туннель)"
+            )
         }
         Err(error) => crate::log_error!(
             "[TUN] NRPT-правило не создано — резолюция пойдёт по интерфейсам: {error}"

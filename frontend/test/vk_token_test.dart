@@ -29,8 +29,7 @@ class _FailingWriteStorage extends FlutterSecureStoragePlatform {
   Future<bool> containsKey({
     required String key,
     required Map<String, String> options,
-  }) async =>
-      _store.containsKey(key);
+  }) async => _store.containsKey(key);
 
   @override
   Future<String?> read({
@@ -63,8 +62,7 @@ class _FailingWriteStorage extends FlutterSecureStoragePlatform {
   @override
   Future<Map<String, String>> readAll({
     required Map<String, String> options,
-  }) async =>
-      Map.of(_store);
+  }) async => Map.of(_store);
 
   @override
   Future<void> deleteAll({required Map<String, String> options}) async {
@@ -166,59 +164,72 @@ void main() {
       expect(await VkToken.has(), isFalse);
     });
 
-    test('readWithStatus при недоступном хранилище без файла: причина', () async {
-      // libsecret без Secret Service падает и на чтении тоже
-      FlutterSecureStoragePlatform.instance =
-          _FailingWriteStorage(failRead: true);
-      final read = await VkToken.readWithStatus();
-      expect(read.token, isNull);
-      expect(read.issue, contains('нет Secret Service'));
-    });
+    test(
+      'readWithStatus при недоступном хранилище без файла: причина',
+      () async {
+        // libsecret без Secret Service падает и на чтении тоже
+        FlutterSecureStoragePlatform.instance = _FailingWriteStorage(
+          failRead: true,
+        );
+        final read = await VkToken.readWithStatus();
+        expect(read.token, isNull);
+        expect(read.issue, contains('нет Secret Service'));
+      },
+    );
 
-    test('миграция: keyring появился — токен переезжает из файла наверх',
-        () async {
-      // Токен остался в файл-фолбэке с прошлой жизни без keyring…
-      final file = File(
-          '${tmp.path}${Platform.pathSeparator}focsq${Platform.pathSeparator}vk_token');
-      await file.parent.create(recursive: true);
-      await file.writeAsString('tok_from_file');
+    test(
+      'миграция: keyring появился — токен переезжает из файла наверх',
+      () async {
+        // Токен остался в файл-фолбэке с прошлой жизни без keyring…
+        final file = File(
+          '${tmp.path}${Platform.pathSeparator}focsq${Platform.pathSeparator}vk_token',
+        );
+        await file.parent.create(recursive: true);
+        await file.writeAsString('tok_from_file');
 
-      // …хранилище снова работает (setUp дал обычный мок)
-      expect(await VkToken.get(), 'tok_from_file');
-      expect(
-        LogService().lines.where((l) => l.contains('перенесён из файла')),
-        isNotEmpty,
-      );
-      // Файл удалён, токен живёт в защищённом хранилище
-      expect(await file.exists(), isFalse);
-      expect(await VkToken.get(), 'tok_from_file');
-    });
+        // …хранилище снова работает (setUp дал обычный мок)
+        expect(await VkToken.get(), 'tok_from_file');
+        expect(
+          LogService().lines.where((l) => l.contains('перенесён из файла')),
+          isNotEmpty,
+        );
+        // Файл удалён, токен живёт в защищённом хранилище
+        expect(await file.exists(), isFalse);
+        expect(await VkToken.get(), 'tok_from_file');
+      },
+    );
 
-    test('readWithStatus на пустом хранилище: токена нет, ошибок нет', () async {
-      final read = await VkToken.readWithStatus();
-      expect(read.token, isNull);
-      expect(read.issue, isNull);
-    });
+    test(
+      'readWithStatus на пустом хранилище: токена нет, ошибок нет',
+      () async {
+        final read = await VkToken.readWithStatus();
+        expect(read.token, isNull);
+        expect(read.issue, isNull);
+      },
+    );
 
     test('save тримит пробелы вокруг токена', () async {
       await VkToken.save('  tok_123  ');
       expect(await VkToken.get(), 'tok_123');
     });
 
-    test('полный отказ: хранилище и файл недоступны — причина для алерта',
-        () async {
-      FlutterSecureStoragePlatform.instance = _FailingWriteStorage();
-      // Каталог фолбэка — под обычным ФАЙЛОМ: создать нельзя.
-      final blocker =
-          File('${Directory.systemTemp.path}/focsq_vk_blocker.txt');
-      await blocker.writeAsString('not a directory');
-      addTearDown(() => blocker.deleteSync());
-      VkToken.fallbackDirForTest = blocker.path;
+    test(
+      'полный отказ: хранилище и файл недоступны — причина для алерта',
+      () async {
+        FlutterSecureStoragePlatform.instance = _FailingWriteStorage();
+        // Каталог фолбэка — под обычным ФАЙЛОМ: создать нельзя.
+        final blocker = File(
+          '${Directory.systemTemp.path}/focsq_vk_blocker.txt',
+        );
+        await blocker.writeAsString('not a directory');
+        addTearDown(() => blocker.deleteSync());
+        VkToken.fallbackDirForTest = blocker.path;
 
-      final reason = await VkToken.save('tok_123');
-      expect(reason, isNotNull);
-      expect(reason, contains('не удалось сохранить'));
-      expect(LogService().lines.last, contains('Токен не сохранён'));
-    });
+        final reason = await VkToken.save('tok_123');
+        expect(reason, isNotNull);
+        expect(reason, contains('не удалось сохранить'));
+        expect(LogService().lines.last, contains('Токен не сохранён'));
+      },
+    );
   });
 }

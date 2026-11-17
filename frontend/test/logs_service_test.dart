@@ -1,5 +1,8 @@
+import 'dart:io';
+
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:frontend/l10n/app_locale.dart';
 import 'package:frontend/service/logs.dart';
 
 /// Тесты LogService: группировка повторов (xN), обновление статусных строк
@@ -13,6 +16,7 @@ void main() {
   tearDownAll(() {
     LogService.developerMode = false;
     LogService().clear();
+    LocaleService.dirOverrideForTest = null;
   });
 
   group('isErrorLine', () {
@@ -24,6 +28,21 @@ void main() {
       expect(LogService.isErrorLine('[ВОРКЕР] Поток готов ✓'), isFalse);
       // Русинусное «Таймаут» — не в списке ключевых слов (там латиница)
       expect(LogService.isErrorLine('Таймаут ожидания'), isFalse);
+    });
+
+    test('лимит потоков — ошибка, лимит сессии капчи — нет', () {
+      expect(
+        LogService.isErrorLine(
+          'превышен лимит потоков сервера (invalid_worker_count)',
+        ),
+        isTrue,
+      );
+      expect(
+        LogService.isErrorLine(
+          '[КАПЧА] Превышен лимит сессии капчи. Ожидаю 5 секунд...',
+        ),
+        isFalse,
+      );
     });
   });
 
@@ -37,7 +56,10 @@ void main() {
     test('строка получает метку времени', () {
       LogService().add('[КОННЕКТ] Привет');
       expect(LogService().lines, hasLength(1));
-      expect(LogService().lines.single, matches(r'^\[\d{2}:\d{2}:\d{2}\] \[КОННЕКТ\] Привет$'));
+      expect(
+        LogService().lines.single,
+        matches(r'^\[\d{2}:\d{2}:\d{2}\] \[КОННЕКТ\] Привет$'),
+      );
     });
 
     test('подряд идущие дубли схлопываются в xN', () {
@@ -71,7 +93,7 @@ void main() {
         logs.add('__CSQTT_EVENT__|READY|{"worker":$i}');
       }
       expect(logs.lines, hasLength(1));
-      expect(logs.lines.single, contains('[ВОРКЕР] Поток готов'));
+      expect(logs.lines.single, contains('[WORKER] Поток готов'));
       expect(logs.lines.single, contains('(x3)'));
     });
 
@@ -86,11 +108,13 @@ void main() {
         '__CSQTT_EVENT__|STATS|{"active":10,"bytes_up":1048576,"bytes_down":1048576}',
       );
 
-      final networkLines =
-          logs.lines.where((l) => l.contains('[СЕТЬ]')).toList();
+      final networkLines = logs.lines
+          .where((l) => l.contains('[NET]'))
+          .toList();
       expect(networkLines, hasLength(1));
       expect(networkLines.single, contains('Активных потоков: 10'));
-      expect(networkLines.single, contains('2.00 МБ'));
+      // ↑/↓ раздельно (порт 2.5.2 диагностики направлений): 1 МБ вверх и 1 МБ вниз
+      expect(networkLines.single, contains('↑1.00 ↓1.00 МБ'));
       expect(networkLines.single, isNot(contains('(x')));
     });
 
@@ -154,7 +178,10 @@ void main() {
       }
       expect(logs.lines, hasLength(LogService.maxLines));
       expect(logs.lines.first, contains('строка номер 6'));
-      expect(logs.lines.last, contains('строка номер ${LogService.maxLines + 5}'));
+      expect(
+        logs.lines.last,
+        contains('строка номер ${LogService.maxLines + 5}'),
+      );
     });
   });
 
@@ -184,6 +211,52 @@ void main() {
     test('представление немутабельное', () {
       LogService().add('[КОННЕКТ] Тест');
       expect(() => LogService().lines.add('взлом'), throwsUnsupportedError);
+    });
+  });
+
+  group('локализатор ядра не меняет видимость', () {
+    setUp(() async {
+      final temp = await Directory.systemTemp.createTemp('focsq_locale_test');
+      LocaleService.dirOverrideForTest = () => temp;
+      await LocaleService.setLanguage(AppLanguage.english);
+      LogService.developerMode = false;
+      LogService().clear();
+    });
+
+    tearDown(() async {
+      await LocaleService.setLanguage(AppLanguage.russian);
+      LocaleService.dirOverrideForTest = null;
+    });
+
+    test('скрытые фильтром строки остаются скрытыми и в EN', () {
+      LogService().add('[СТАТИСТИКА] Активных: 9 | Трафик: 0.00 МБ');
+      LogService().add('[КРЕД #1] Запрос (хеш: NyHuaZSh...)');
+      LogService().add(
+        '[TUN] TURN 1.2.3.4: перехвата ещё нет, исключим при TUNCONF',
+      );
+      LogService().add('[СЕССИЯ #9] Relay: 1.2.3.4:1');
+
+      expect(
+        LogService().lines.where((l) => l.contains('[STATISTICS]')),
+        isEmpty,
+      );
+      expect(LogService().lines.where((l) => l.contains('[CRED')), isEmpty);
+      expect(
+        LogService().lines.where((l) => l.contains('interception not yet')),
+        isEmpty,
+      );
+      expect(LogService().lines.where((l) => l.contains('Relay:')), isEmpty);
+    });
+
+    test('видимые строки переводятся в EN', () {
+      LogService().add('[КЛИЕНТ] Tunnel IP: 10.0.0.1/32 | DNS: 1.1.1.1');
+
+      expect(
+        LogService().lines.where(
+          (l) => l.contains('[CLIENT] Tunnel IP: 10.0.0.1/32'),
+        ),
+        isNotEmpty,
+      );
     });
   });
 }

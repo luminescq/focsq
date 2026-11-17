@@ -1,7 +1,9 @@
-﻿// SPDX-FileCopyrightText: 2026 luminescq
+// SPDX-FileCopyrightText: 2026 luminescq
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
+
+import '../l10n/app_locale.dart';
 import 'profile_form_components.dart';
 import '../theme/app_colors.dart';
 import '../models/server_profile.dart';
@@ -48,8 +50,8 @@ class _AddProfileModalState extends State<AddProfileModal> {
   final _ipCtrl = TextEditingController();
   final _portCtrl = TextEditingController();
   final _passCtrl = TextEditingController();
-  double _power = 9;
-  double _maxPower = 90;
+  double _power = 10;
+  double _maxPower = 100;
 
   String? _ipError;
   String? _portError;
@@ -58,7 +60,7 @@ class _AddProfileModalState extends State<AddProfileModal> {
   @override
   void initState() {
     super.initState();
-    _nameCtrl.text = 'Узел #${math.Random().nextInt(9000) + 1000}';
+    _nameCtrl.text = S.defaultNodeName(math.Random().nextInt(9000) + 1000);
     _ipCtrl.addListener(() => _clearError(() => _ipError = null));
     _portCtrl.addListener(() => _clearError(() => _portError = null));
     _passCtrl.addListener(() => _clearError(() => _passError = null));
@@ -95,9 +97,9 @@ class _AddProfileModalState extends State<AddProfileModal> {
     final password = _passCtrl.text.trim();
 
     setState(() {
-      _ipError = ip.isEmpty ? 'Укажите IP' : null;
-      _portError = ImportService.isValidPort(port) ? null : 'Порт: 1–65535';
-      _passError = password.isEmpty ? 'Укажите пароль' : null;
+      _ipError = ip.isEmpty ? S.errIpRequired : null;
+      _portError = ImportService.isValidPort(port) ? null : S.errPortRange;
+      _passError = password.isEmpty ? S.errPassRequired : null;
     });
     if (_ipError != null || _portError != null || _passError != null) {
       return;
@@ -113,7 +115,7 @@ class _AddProfileModalState extends State<AddProfileModal> {
     await DbService.saveProfile(profile);
     if (mounted) {
       Navigator.pop(context);
-      AlertService.showProfileAdded(context, profile.name ?? 'Без имени');
+      AlertService.showProfileAdded(context, profile.name ?? S.unnamedProfile);
     }
   }
 
@@ -127,7 +129,7 @@ class _AddProfileModalState extends State<AddProfileModal> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            const ModalTopBar(title: 'Добавить профиль'),
+            ModalTopBar(title: S.addProfile),
             const SizedBox(height: 8),
             Container(
               width: double.infinity,
@@ -141,16 +143,19 @@ class _AddProfileModalState extends State<AddProfileModal> {
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const SectionDivider(text: 'Данные профиля'),
+                  SectionDivider(text: S.profileData),
                   const SizedBox(height: 16),
-                  CustomTextField(hint: 'Имя профиля', controller: _nameCtrl),
+                  CustomTextField(
+                    hint: S.profileNameHint,
+                    controller: _nameCtrl,
+                  ),
                   const SizedBox(height: 12),
                   Row(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Expanded(
                         child: CustomTextField(
-                          hint: 'IP-адрес',
+                          hint: S.ipHint,
                           controller: _ipCtrl,
                           error: _ipError,
                         ),
@@ -158,7 +163,7 @@ class _AddProfileModalState extends State<AddProfileModal> {
                       const SizedBox(width: 12),
                       Expanded(
                         child: CustomTextField(
-                          hint: 'Порт',
+                          hint: S.port,
                           controller: _portCtrl,
                           error: _portError,
                         ),
@@ -169,7 +174,7 @@ class _AddProfileModalState extends State<AddProfileModal> {
                     height: (_ipError != null || _portError != null) ? 4 : 12,
                   ),
                   CustomTextField(
-                    hint: 'Пароль профиля',
+                    hint: S.passwordHint,
                     controller: _passCtrl,
                     error: _passError,
                   ),
@@ -178,8 +183,8 @@ class _AddProfileModalState extends State<AddProfileModal> {
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      const Text(
-                        'Мощность',
+                      Text(
+                        S.power,
                         style: TextStyle(
                           color: AppColors.textPrimary,
                           fontSize: 12,
@@ -187,7 +192,7 @@ class _AddProfileModalState extends State<AddProfileModal> {
                         ),
                       ),
                       Text(
-                        '${_power.toInt()} потоков',
+                        S.threadsCount(_power.toInt()),
                         style: const TextStyle(
                           color: AppColors.textPrimary,
                           fontSize: 12,
@@ -213,9 +218,9 @@ class _AddProfileModalState extends State<AddProfileModal> {
                     ),
                     child: Slider(
                       value: _power,
-                      min: 9,
+                      min: 10,
                       max: _maxPower,
-                      divisions: ((_maxPower - 9) / 9).round(),
+                      divisions: sliderDivisionsFor(_maxPower),
                       onChanged: (v) => setState(() => _power = v),
                     ),
                   ),
@@ -234,8 +239,8 @@ class _AddProfileModalState extends State<AddProfileModal> {
                           borderRadius: BorderRadius.circular(10),
                         ),
                       ),
-                      child: const Text(
-                        'Сохранить',
+                      child: Text(
+                        S.save,
                         style: TextStyle(
                           fontSize: 14,
                           fontWeight: FontWeight.w800,

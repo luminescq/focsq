@@ -1,0 +1,40 @@
+{
+    "schema":  "csqtt.native-client-provenance.v3",
+    "marker":  "CSQTT_RUST_NATIVE_PRODUCTION_V1",
+    "producer":  "rust-client/build_so.bat",
+    "runtime":  "rust",
+    "buildSystem":  "cargo-ndk",
+    "profile":  "release",
+    "transport":  "rust-turn-sans-io-rfc8656-channeldata",
+    "transportMarker":  "CSQTT_RUST_TURN_SANS_IO_V1",
+    "nativeCoreAbi":  1,
+    "package":  "csqtt-client",
+    "version":  "2.5.0",
+    "buildInputSha256":  "59E5BF3469952DD5BAABBBA87E48BE5D0C167C1A0E15FD1B3047DF0834C298E2",
+    "cargoTomlSha256":  "76E519E78865CE29C2F23BF235B0E10352A3D4AB9DBD3F2D1F0905C42966223F",
+    "cargoLockSha256":  "F0E7681AA151E62112C98541C0ADC264F8A043BE534430DFCC451D9AECF6400B",
+    "generatedAtUtc":  "2026-10-26T13:33:20.8840345Z",
+    "artifacts":  [
+                      {
+                          "abi":  "arm64-v8a",
+                          "target":  "aarch64-linux-android",
+                          "path":  "app/src/main/jniLibs/arm64-v8a/libclient.so",
+                          "size":  9390304,
+                          "sha256":  "C56782D60CA8DCEEA77FC6BF025614ADDF54934C53365F5CB26D5163F272F138"
+                      },
+                      {
+                          "abi":  "armeabi-v7a",
+                          "target":  "armv7-linux-androideabi",
+                          "path":  "app/src/main/jniLibs/armeabi-v7a/libclient.so",
+                          "size":  6847496,
+                          "sha256":  "7BCC34D0F19C08A1EAB9EDD93567B68EBAB1A3524EB82F282664B64050813C01"
+                      },
+                      {
+                          "abi":  "x86_64",
+                          "target":  "x86_64-linux-android",
+                          "path":  "app/src/main/jniLibs/x86_64/libclient.so",
+                          "size":  11045000,
+                          "sha256":  "20ADEE34DB938B9C3272CD4578D32DBA4D5F61C67856EBDA2D1873B41C69296B"
+                      }
+                  ]
+}

@@ -1,4 +1,4 @@
-﻿// SPDX-FileCopyrightText: 2026 luminescq
+// SPDX-FileCopyrightText: 2026 luminescq
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 use csqtt_core::ClientConfig;
 use std::sync::Mutex;
@@ -43,7 +43,11 @@ pub fn send_control_command(command: String) -> bool {
 
 /// Пауза/возобновление обработки трафика воркерами
 pub fn set_client_paused(paused: bool) -> bool {
-    csqtt_core::submit_control_line(if paused { "PAUSE".to_owned() } else { "RESUME".to_owned() })
+    csqtt_core::submit_control_line(if paused {
+        "PAUSE".to_owned()
+    } else {
+        "RESUME".to_owned()
+    })
 }
 
 /// Передать результат решения WebView-капчи в ядро (success_token или "error:...")
@@ -72,6 +76,14 @@ pub struct AppClientConfig {
     pub tun_uds: String,
     pub validate_vk_hashes: bool,
     pub vk_js_token: String,
+    pub domain_routing: bool,
+    pub exclude_ru_zones: bool,
+    pub template_domains: bool,
+    pub domain_whitelist: bool,
+    pub direct_domains: String,
+    pub ip_routing: bool,
+    pub ip_whitelist: bool,
+    pub direct_ips: String,
 }
 
 impl Into<ClientConfig> for AppClientConfig {
@@ -97,6 +109,14 @@ impl Into<ClientConfig> for AppClientConfig {
             tun_uds: self.tun_uds,
             validate_vk_hashes: self.validate_vk_hashes,
             vk_js_token: self.vk_js_token,
+            domain_routing: self.domain_routing,
+            exclude_ru_zones: self.exclude_ru_zones,
+            template_domains: self.template_domains,
+            domain_whitelist: self.domain_whitelist,
+            direct_domains: self.direct_domains,
+            ip_routing: self.ip_routing,
+            ip_whitelist: self.ip_whitelist,
+            direct_ips: self.direct_ips,
         }
     }
 }
@@ -106,19 +126,25 @@ pub async fn start_csqtt_client(config: AppClientConfig) -> anyhow::Result<()> {
     csqtt_core::set_events_enabled(true);
 
     let cancel = CancellationToken::new();
-    
+
     {
-        let mut guard = CANCEL_TOKEN.get_or_init(|| Mutex::new(None)).lock().unwrap();
+        let mut guard = CANCEL_TOKEN
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap();
         *guard = Some(cancel.clone());
     }
-    
+
     let result = csqtt_core::run_client(config.into(), Some(cancel)).await;
-    
+
     {
-        let mut guard = CANCEL_TOKEN.get_or_init(|| Mutex::new(None)).lock().unwrap();
+        let mut guard = CANCEL_TOKEN
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap();
         *guard = None;
     }
-    
+
     result?;
     Ok(())
 }

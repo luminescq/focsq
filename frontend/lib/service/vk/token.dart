@@ -1,13 +1,19 @@
-﻿// SPDX-FileCopyrightText: 2026 luminescq
+// SPDX-FileCopyrightText: 2026 luminescq
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 import 'dart:async';
 import 'dart:io';
 
 import 'package:desktop_webview_window/desktop_webview_window.dart';
 import 'package:flutter/services.dart' show PlatformException;
+
+import '../../l10n/app_locale.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import '../logs.dart';
+import '../webview_data_dir.dart';
+import '../webview_debug_log.dart';
+import 'auth_url.dart';
+import 'net_error.dart';
 
 class VkToken {
   VkToken._();
@@ -20,17 +26,19 @@ class VkToken {
   static String? fallbackDirForTest;
 
   static File get _fallbackFile {
-    final base = fallbackDirForTest ??
+    final base =
+        fallbackDirForTest ??
         (Platform.isLinux
             ? (Platform.environment['XDG_DATA_HOME'] ??
-                '${Platform.environment['HOME']}/.local/share')
-            : (Platform.environment['APPDATA'] ??
-                Directory.systemTemp.path));
+                  '${Platform.environment['HOME']}/.local/share')
+            : (Platform.environment['APPDATA'] ?? Directory.systemTemp.path));
     return File(
-        '$base${Platform.pathSeparator}focsq${Platform.pathSeparator}vk_token');
+      '$base${Platform.pathSeparator}focsq${Platform.pathSeparator}vk_token',
+    );
   }
 
-  static const String _authUrl = 'https://oauth.vk.ru/authorize?'
+  static const String _authUrl =
+      'https://oauth.vk.ru/authorize?'
       'client_id=7793118&'
       'scope=1073737727&'
       'redirect_uri=https://oauth.vk.ru/blank.html&'
@@ -39,76 +47,205 @@ class VkToken {
       'revoke=1&'
       'v=5.199';
 
+  static const Duration _loginTimeout = Duration(minutes: 5);
+  static const Duration _warmupDelay = Duration(seconds: 2);
+  static const int _maxSilentRestarts = 1;
+  static const String _warmupUrl = 'https://vk.com/';
+  static const String _authLabel = 'oauth.vk.ru/authorize';
+
   static Future<String?> login() async {
+    final debugLog = await WebViewDebugLog.start('vk_auth');
+    void dbg(String message) {
+      final safe = WebViewDebugLog.redact(message);
+      LogService().add('[VKDBG] $safe');
+      debugLog?.add(safe);
+    }
+
+    if (WebViewDebugLog.enabled) {
+      dbg(
+        debugLog == null
+            ? 'debug log: unavailable'
+            : 'debug log: ${debugLog.file.path}',
+      );
+    }
+
     final available = await WebviewWindow.isWebviewAvailable();
     if (!available) {
-
-      LogService().add('[ВК] WebView недоступен на этой машине');
-      return 'WebView недоступен на этой машине '
-          '(на Windows: установи WebView2 Runtime)';
+      dbg('webview unavailable');
+      LogService().add(S.vkWebviewUnavailableLog);
+      await debugLog?.stop();
+      return S.vkWebviewUnavailableMsg;
     }
 
     final completer = Completer<String?>();
 
     final Webview webview = await WebviewWindow.create(
       configuration: CreateConfiguration(
-        title: 'Авторизация ВКонтакте',
+        title: S.vkAuthWindowTitle,
         titleBarHeight: 0,
         windowWidth: 500,
         windowHeight: 700,
 
-        userDataFolderWindows: 'vk_auth_data',
+        userDataFolderWindows: webviewDataDir('vk_auth_data'),
       ),
     );
+    dbg('window created');
 
-    webview.launch(_authUrl);
+    if (WebViewDebugLog.enabled) {
+      webview.addScriptToExecuteOnDocumentCreated(
+        WebViewDebugLog.injectedScript,
+      );
+      dbg('js debug hook installed');
+    }
 
-    final timer = Timer.periodic(const Duration(milliseconds: 500), (t) async {
-      if (completer.isCompleted) {
-        t.cancel();
+    var finished = false;
+    var busy = false;
+    var silentRestarts = 0;
+    var jsErrorLogged = false;
+    String? lastHref;
+    Timer? poll;
+    Timer? deadline;
+
+    void finish(String? error) {
+      if (finished) return;
+      finished = true;
+      dbg('finish: ${error ?? 'ok'}');
+      poll?.cancel();
+      deadline?.cancel();
+      if (!completer.isCompleted) completer.complete(error);
+      try {
+        webview.removeAllWebMessageReceivedCallback();
+      } catch (_) {}
+      _closeQuietly(webview);
+      unawaited(debugLog?.stop());
+    }
+
+    if (WebViewDebugLog.enabled) {
+      webview.addOnWebMessageReceivedCallback((message) {
+        final line = WebViewDebugLog.takeMessage(message);
+        if (line == null) return;
+        dbg(line);
+
+        // VK присылает ошибки в JSON-ответах api.vk.*, а не в URL.
+        // Раньше это выяснялось только ожиданием 5-минутного тайм-аута.
+        final issue = _vkIssueFromDebugLine(line);
+        if (issue != null) {
+          scheduleMicrotask(() => finish(issue));
+        }
+      });
+    }
+
+    Future<void> retryAfterSilent() async {
+      if (silentRestarts >= _maxSilentRestarts) {
+        finish(S.vkSilentTokenFailed);
         return;
       }
+      silentRestarts++;
+      dbg(
+        'silent_token pass $silentRestarts/$_maxSilentRestarts: '
+        'vk.com warm-up',
+      );
+      // VK проставит cookie активной сессии, и второй проход по OAuth
+      // покажет «Продолжить как <Имя>» — уже с access_token.
       try {
-        final url = await webview.evaluateJavaScript('window.location.href');
-        if (url == null) return;
-        final unquoted = url.replaceAll('"', '');
+        await webview.launch(_warmupUrl);
+      } catch (error) {
+        dbg('warm-up launch failed: $error');
+      }
+      await Future<void>.delayed(_warmupDelay);
+      try {
+        await webview.launch(_authUrl);
+      } catch (error) {
+        dbg('auth launch failed: $error');
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 800));
+    }
 
-        final parsed = Uri.tryParse(unquoted);
-        final isBlankRedirect = parsed != null &&
-            (parsed.host == 'oauth.vk.ru' || parsed.host == 'oauth.vk.com') &&
-            parsed.path == '/blank.html';
-        if (!isBlankRedirect) return;
+    webview.onClose.then((_) {
+      finish(S.vkWindowClosedEarly);
+    });
 
-        final tokenUri = Uri.parse(unquoted.replaceFirst('#', '?'));
-        final token = tokenUri.queryParameters['access_token'];
-        t.cancel();
-        if (!completer.isCompleted) {
-          completer.complete(
-            (token != null && token.isNotEmpty) ? token : null,
-          );
+    poll = Timer.periodic(const Duration(milliseconds: 500), (timer) async {
+      if (finished || busy) return;
+
+      String? href;
+      try {
+        href = await webview.evaluateJavaScript('window.location.href');
+      } catch (error) {
+        if (!jsErrorLogged) {
+          jsErrorLogged = true;
+          dbg('evaluateJavaScript failed: $error');
         }
-        _closeQuietly(webview);
-      } catch (_) {
+        return;
+      }
+      if (href == null || href.isEmpty) return;
+
+      final url = unwrapEvaluatedUrl(href);
+      if (url != lastHref) {
+        lastHref = url;
+        dbg('nav $url');
+      }
+
+      final capture = parseVkAuthUrl(href);
+      if (capture == null) return;
+      if (!capture.hasToken &&
+          !capture.hasError &&
+          !capture.hasCode &&
+          !capture.silentToken) {
+        return;
+      }
+
+      dbg('capture ${capture.debugSummary}');
+      busy = true;
+      try {
+        if (capture.hasToken) {
+          finish(await save(capture.accessToken!));
+        } else if (capture.hasError) {
+          finish(
+            S.vkOAuthError(capture.error!, capture.errorDescription ?? ''),
+          );
+        } else if (capture.hasCode) {
+          dbg('VK returned an auth code, not a token');
+          finish(S.vkCodeInsteadOfToken);
+        } else {
+          await retryAfterSilent();
+        }
+      } finally {
+        if (!finished) busy = false;
       }
     });
 
-    webview.onClose.then((_) {
-      timer.cancel();
-      if (!completer.isCompleted) completer.complete(null);
+    deadline = Timer(_loginTimeout, () {
+      if (finished) return;
+      dbg('login timeout');
+      LogService().add(S.vkTokenTimeout);
+      finish(S.vkLoginTimeoutMsg(_loginTimeout.inMinutes));
     });
 
-    final token = await completer.future.timeout(
-      const Duration(minutes: 5),
-      onTimeout: () {
-        LogService().add('[ВК] Тайм-аут ожидания токена');
-        _closeQuietly(webview);
-        return null;
-      },
-    );
+    dbg('launch $_authLabel');
+    try {
+      await webview.launch(_authUrl);
+    } catch (error) {
+      dbg('launch failed: $error');
+    }
+    return completer.future;
+  }
 
-    if (token == null) return 'окно закрыто до завершения входа';
+  /// Разбирает `[net]`-строку из JS-хука. Возвращает текст для UI, если
+  /// VK уже ответил ошибкой, из-за которой ждать токен бессмысленно.
+  static String? _vkIssueFromDebugLine(String line) {
+    final issue = parseVkNetIssue(line);
+    if (issue == null) return null;
 
-    return save(token);
+    if (issue.isFloodControl) return S.vkFloodControl;
+    if (issue.isPasskeyRequired) return S.vkPasskeyUnsupported;
+    if (issue.isAccountBlocked) return S.vkAccountBlocked;
+
+    // Ошибки промежуточных шагов (отправка кода, капча, валидация)
+    // VK ID показывает сам и даёт повторить — окно не закрываем.
+    // Обрываем вход только когда VK отказал в самом токене.
+    if (!line.contains('/method/auth.getOauthToken')) return null;
+    return S.vkApiError(issue.code, issue.detail);
   }
 
   static void _closeQuietly(Webview webview) {
@@ -122,7 +259,7 @@ class VkToken {
 
     final secureIssue = await _writeSecure(token);
     if (secureIssue == null) {
-      LogService().add('[ВК] Токен сохранён');
+      LogService().add(S.vkTokenSaved);
       lastNotice = null;
 
       await _deleteFallback();
@@ -134,20 +271,15 @@ class VkToken {
       await file.parent.create(recursive: true);
       await file.writeAsString(token, flush: true);
       if (Platform.isLinux) {
-
         await Process.run('chmod', ['600', file.path]);
       }
-      LogService().add('[ВК] Secret Service недоступен ($secureIssue) — '
-          'токен сохранён в файл без шифрования');
-      lastNotice = 'Токен сохранён в файл без шифрования: на этой системе '
-          'нет Secret Service (KDE без gnome-keyring или Live-сессия). '
-          'Установи gnome-keyring, войди заново — токен переедет в '
-          'защищённое хранилище.';
+      LogService().add(S.vkSecretFallback(secureIssue));
+      lastNotice = S.vkFallbackNotice;
       return null;
     } catch (error) {
-      LogService().add('[ВК] Токен не сохранён: $error');
+      LogService().add(S.vkTokenSaveFailed(error));
       lastNotice = null;
-      return 'не удалось сохранить токен: $error';
+      return S.vkSaveFailedMsg(error);
     }
   }
 
@@ -179,13 +311,11 @@ class VkToken {
 
         if (await _writeSecure(token) == null) {
           await file.delete();
-          LogService()
-              .add('[ВК] Токен перенесён из файла в защищённое хранилище');
+          LogService().add(S.vkTokenMoved);
         }
         return (token: token, issue: null);
       }
-    } catch (_) {
-    }
+    } catch (_) {}
     return (token: null, issue: secureIssue);
   }
 
@@ -194,7 +324,7 @@ class VkToken {
   static Future<bool> has() async {
     final read = await readWithStatus();
     if (read.issue != null) {
-      LogService().add('[ВК] Токен недоступен: ${read.issue}');
+      LogService().add(S.vkTokenUnavailable(read.issue!));
     }
     return read.token != null && read.token!.isNotEmpty;
   }
@@ -203,15 +333,13 @@ class VkToken {
     if (error is PlatformException) {
       switch (error.code) {
         case 'KeyringLocked':
-          return 'хранилище заблокировано — разблокируй keyring '
-              '(пароль обычно вводится при входе в систему)';
+          return S.vkKeyringLocked;
         case 'Libsecret error':
-          return 'нет Secret Service — установи gnome-keyring '
-              '(работает и в KDE, в отличие от KWallet)';
+          return S.vkNoSecretService;
         case 'SecretNotFound':
-          return 'запись не найдена';
+          return S.vkSecretNotFound;
         default:
-          return '${error.code}: ${error.message ?? "без описания"}';
+          return '${error.code}: ${error.message ?? S.vkNoDescription}';
       }
     }
     return error.toString();
@@ -229,8 +357,7 @@ class VkToken {
     try {
       await _storage.delete(key: _key);
     } catch (error) {
-      LogService().add(
-          '[ВК] Не удалось удалить токен: ${describeStorageError(error)}');
+      LogService().add(S.vkTokenDeleteFailed(describeStorageError(error)));
       ok = false;
     }
     try {

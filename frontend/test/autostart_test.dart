@@ -29,16 +29,16 @@ void main() {
     });
 
     test('путь с пробелами экранируется кавычками', () {
-      final entry =
-          AutostartService.buildDesktopEntry('/opt/My Apps/focsq.sh');
+      final entry = AutostartService.buildDesktopEntry('/opt/My Apps/focsq.sh');
       expect(entry, contains('Exec="/opt/My Apps/focsq.sh" --minimized\n'));
     });
 
     test('путь с переменной шелла не ломает разбор', () {
       // Переменные в Exec разворачивает шелл — путь с $ внутри кавычек
       // всё равно пишется как есть.
-      final entry =
-          AutostartService.buildDesktopEntry(r'/home/u/$app/focsq.sh');
+      final entry = AutostartService.buildDesktopEntry(
+        r'/home/u/$app/focsq.sh',
+      );
       expect(entry, contains(r'Exec="/home/u/$app/focsq.sh" --minimized'));
     });
   });

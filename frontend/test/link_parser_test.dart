@@ -45,7 +45,7 @@ void main() {
       expect(profile.password, 'pw');
     });
 
-    test('hashes из ссылки игнорируются (режим хешей живёт в настройках)', () {
+    test('ссылка с hashes содержит корректный профиль', () {
       final profile = parser.parse(
         'csqtt://connect?v=2&host=10.0.0.1&peer=443&password=p&hashes=abc123,def456',
       );
@@ -64,21 +64,197 @@ void main() {
       expect(profile!.password, 'my@pass word');
     });
 
+    test('лишний слэш после connect распознаётся', () {
+      final profile = parser.parse(
+        'csqtt://connect/?v=2&host=203.0.113.88&peer=46000&password=dummy_secret_pass',
+      );
+
+      expect(profile, isNotNull);
+      expect(profile!.ip, '203.0.113.88');
+      expect(profile.port, 46000);
+      expect(profile.password, 'dummy_secret_pass');
+    });
+
+    test('HTML-экранированная форма (&amp;) распознаётся', () {
+      final profile = parser.parse(
+        'csqtt://connect?v=2&amp;host=203.0.113.88&amp;peer=46000'
+        '&amp;password=dummy_secret_pass',
+      );
+
+      expect(profile, isNotNull);
+      expect(profile!.ip, '203.0.113.88');
+      expect(profile.port, 46000);
+      expect(profile.password, 'dummy_secret_pass');
+    });
+
+    test('разделители, закодированные как %26, распознаются', () {
+      final profile = parser.parse(
+        'csqtt://connect?v=2%26host=203.0.113.88%26peer=46000'
+        '%26password=dummy_secret_pass',
+      );
+
+      expect(profile, isNotNull);
+      expect(profile!.ip, '203.0.113.88');
+      expect(profile.port, 46000);
+    });
+
+    test('точка с запятой как разделитель и фрагмент поддерживаются', () {
+      final profile = parser.parse(
+        'csqtt://connect?v=2;host=203.0.113.88;peer=46000;password=pw#frag',
+      );
+
+      expect(profile, isNotNull);
+      expect(profile!.ip, '203.0.113.88');
+      expect(profile.port, 46000);
+      expect(profile.password, 'pw');
+    });
+
+    test('password со встроенным key= не режется', () {
+      final profile = parser.parse(
+        'csqtt://connect?v=2&host=h&peer=443&password=abcpower=123',
+      );
+
+      expect(profile, isNotNull);
+      expect(profile!.password, 'abcpower=123');
+      expect(profile.power, isNull);
+    });
+
+    test('password со встроенным hashes= не мешает хешам', () {
+      const link =
+          'csqtt://connect?v=2&host=h&peer=443'
+          '&password=abcpower=123&hashes=abc';
+
+      expect(parser.parse(link)!.password, 'abcpower=123');
+      expect(parser.parseHashes(link), 'abc');
+    });
+
     test('неверсионированная или v!=2 ссылка отвергается', () {
-      expect(parser.parse('csqtt://connect?v=1&host=h&peer=80&password=p'), isNull);
+      expect(
+        parser.parse('csqtt://connect?v=1&host=h&peer=80&password=p'),
+        isNull,
+      );
       expect(parser.parse('csqtt://connect?host=h&peer=80&password=p'), isNull);
     });
 
     test('некорректный порт отвергается', () {
-      expect(parser.parse('csqtt://connect?v=2&host=h&peer=0&password=p'), isNull);
-      expect(parser.parse('csqtt://connect?v=2&host=h&peer=70000&password=p'), isNull);
-      expect(parser.parse('csqtt://connect?v=2&host=h&peer=abc&password=p'), isNull);
+      expect(
+        parser.parse('csqtt://connect?v=2&host=h&peer=0&password=p'),
+        isNull,
+      );
+      expect(
+        parser.parse('csqtt://connect?v=2&host=h&peer=70000&password=p'),
+        isNull,
+      );
+      expect(
+        parser.parse('csqtt://connect?v=2&host=h&peer=abc&password=p'),
+        isNull,
+      );
       expect(parser.parse('csqtt://connect?v=2&host=h&password=p'), isNull);
     });
 
     test('отсутствие host/password отвергается', () {
       expect(parser.parse('csqtt://connect?v=2&peer=443&password=p'), isNull);
       expect(parser.parse('csqtt://connect?v=2&host=h&peer=443'), isNull);
+    });
+
+    test('power извлекается и нормализуется', () {
+      expect(
+        parser
+            .parse('csqtt://connect?v=2&host=h&peer=443&password=p&power=27')!
+            .power,
+        27,
+      );
+      expect(
+        parser
+            .parse('csqtt://connect?v=2&host=h&peer=443&password=p&power=0')!
+            .power,
+        isNull,
+      );
+      expect(
+        parser
+            .parse('csqtt://connect?v=2&host=h&peer=443&password=p&power=-3')!
+            .power,
+        isNull,
+      );
+      expect(
+        parser
+            .parse(
+              'csqtt://connect?v=2&host=h&peer=443&password=p&power=100000',
+            )!
+            .power,
+        ImportService.maxPower,
+      );
+    });
+
+    test(
+      'workers используется, если power отсутствует, и power приоритетнее',
+      () {
+        expect(
+          parser
+              .parse(
+                'csqtt://connect?v=2&host=h&peer=443&password=p&workers=18',
+              )!
+              .power,
+          18,
+        );
+        expect(
+          parser
+              .parse(
+                'csqtt://connect?v=2&host=h&peer=443&password=p&workers=3&power=45',
+              )!
+              .power,
+          45,
+        );
+      },
+    );
+  });
+
+  group('LinkParser / hashes', () {
+    test('декодирует и очищает список', () {
+      expect(
+        parser.parseHashes(
+          'csqtt://connect?v=2&host=h&peer=443&password=p'
+          '&hashes=%20abc%2C%20%2Cdef%20',
+        ),
+        'abc,def',
+      );
+    });
+
+    test('поддерживает склеенные параметры', () {
+      expect(
+        parser.parseHashes(
+          'csqtt://connect?v=2host=hpeer=443password=phashes=abc,def',
+        ),
+        'abc,def',
+      );
+    });
+
+    test('браузерные формы ссылки с hashes поддерживаются', () {
+      expect(
+        parser.parseHashes(
+          'csqtt://connect/?v=2&amp;host=h&amp;peer=443'
+          '&amp;password=p&amp;hashes=abc,def',
+        ),
+        'abc,def',
+      );
+      expect(
+        parser.parseHashes(
+          'csqtt://connect/?v=2&host=h&peer=443&password=p&hashes=abc',
+        ),
+        'abc',
+      );
+    });
+
+    test('пустые, отсутствующие и невалидные хеши не применяются', () {
+      for (final link in [
+        'csqtt://connect?v=2&host=h&peer=443&password=p',
+        'csqtt://connect?v=2&host=h&peer=443&password=p&hashes=%20,,',
+        'csqtt://connect?v=2&host=h&peer=0&password=p&hashes=abc',
+        'csqtt://connect?v=2&host=h&peer=443&password=p&hashes=%zz',
+        'csqtt://p@h:443',
+      ]) {
+        expect(parser.parseHashes(link), isNull);
+      }
     });
   });
 
@@ -95,6 +271,14 @@ void main() {
     test('url-encoded пароль декодируется', () {
       final profile = parser.parse('csqtt://my%40pass@example.com:1000');
       expect(profile!.password, 'my@pass');
+    });
+
+    test('лишний слэш в конце legacy-ссылки не мешает', () {
+      final profile = parser.parse('csqtt://secret@203.0.113.7:46000/');
+
+      expect(profile, isNotNull);
+      expect(profile!.ip, '203.0.113.7');
+      expect(profile.port, 46000);
     });
 
     test('неотэкраненный @ в пароле — деление по последнему @ (был баг)', () {
@@ -129,7 +313,10 @@ void main() {
 
   group('LinkParser / отбраковка', () {
     test('чужая схема и мусор', () {
-      expect(parser.parse('http://connect?v=2&host=h&peer=80&password=p'), isNull);
+      expect(
+        parser.parse('http://connect?v=2&host=h&peer=80&password=p'),
+        isNull,
+      );
       expect(parser.parse('csqttp://x'), isNull);
       expect(parser.parse(''), isNull);
       expect(parser.parse('   '), isNull);

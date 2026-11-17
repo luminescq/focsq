@@ -1,4 +1,4 @@
-﻿// SPDX-FileCopyrightText: 2026 luminescq
+// SPDX-FileCopyrightText: 2026 luminescq
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 import 'dart:async';
 
@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_svg/flutter_svg.dart';
 
+import '../l10n/app_locale.dart';
 import '../service/logs.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_icons.dart';
@@ -118,8 +119,8 @@ class _LogsScreenState extends State<LogsScreen> {
     if (lines.isEmpty) {
       CustomAlert.show(
         context,
-        title: 'Логи пусты',
-        message: 'Пока нечего копировать — журнал пуст',
+        title: S.logsEmptyTitle,
+        message: S.logsEmptyMessage,
         type: AlertType.info,
       );
       return;
@@ -128,8 +129,8 @@ class _LogsScreenState extends State<LogsScreen> {
     if (!mounted) return;
     CustomAlert.show(
       context,
-      title: 'Успех',
-      message: 'Логи скопированы!',
+      title: S.successTitle,
+      message: S.logsCopiedMessage,
       type: AlertType.success,
     );
   }
@@ -137,7 +138,7 @@ class _LogsScreenState extends State<LogsScreen> {
   @override
   Widget build(BuildContext context) {
     return ScreenLayout(
-      title: 'Логи',
+      title: S.logsTitle,
       showDots: true,
       actions: [
         _SearchField(
@@ -147,15 +148,11 @@ class _LogsScreenState extends State<LogsScreen> {
           query: _query,
         ),
         const Spacer(),
-        _ActionIcon(
-          asset: AppIcons.copy,
-          tooltip: 'Копировать',
-          onTap: _copyLogs,
-        ),
+        _ActionIcon(asset: AppIcons.copy, tooltip: S.copy, onTap: _copyLogs),
         const SizedBox(width: 12),
         _ActionIcon(
           asset: AppIcons.clear,
-          tooltip: 'Очистить',
+          tooltip: S.clear,
           onTap: LogService().clear,
         ),
       ],
@@ -207,11 +204,11 @@ class _SearchField extends StatelessWidget {
                 fontSize: 13,
               ),
               cursorColor: Colors.white,
-              decoration: const InputDecoration(
+              decoration: InputDecoration(
                 isDense: true,
                 border: InputBorder.none,
-                hintText: 'Поиск по логам',
-                hintStyle: TextStyle(
+                hintText: S.searchLogs,
+                hintStyle: const TextStyle(
                   color: AppColors.textSecondary,
                   fontSize: 13,
                 ),
@@ -666,7 +663,6 @@ class _LogLineItem extends StatelessWidget {
     );
   }
 }
-
 
 class _ActionIcon extends StatefulWidget {
   final String asset;

@@ -1,11 +1,13 @@
-﻿// SPDX-FileCopyrightText: 2026 luminescq
+// SPDX-FileCopyrightText: 2026 luminescq
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 import 'dart:async';
-import 'dart:ui';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:window_manager/window_manager.dart';
 
+import '../l10n/app_locale.dart';
+import '../service/alert.dart';
 import '../service/app_visibility.dart';
 import '../service/browser.dart';
 import '../service/connect.dart';
@@ -35,9 +37,15 @@ class _MainLayoutState extends State<MainLayout> with WindowListener {
   @override
   void initState() {
     super.initState();
+    HardwareKeyboard.instance.addHandler(_handleKey);
     windowManager.addListener(this);
     windowManager.setPreventClose(true);
     unawaited(_checkForUpdates());
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        unawaited(AlertService.ensureBanDisclaimerAccepted(context));
+      }
+    });
   }
 
   Future<void> _checkForUpdates() async {
@@ -61,6 +69,7 @@ class _MainLayoutState extends State<MainLayout> with WindowListener {
 
   @override
   void dispose() {
+    HardwareKeyboard.instance.removeHandler(_handleKey);
     windowManager.removeListener(this);
     if (ConnectService().state != ConnectState.disconnected) {
       ConnectService().stop();
@@ -84,13 +93,12 @@ class _MainLayoutState extends State<MainLayout> with WindowListener {
       await ConnectService().stop();
     }
     await ConnectService().waitForExit();
-    LogService().add(
-      '[КОННЕКТ] Закрытие окна: destroy (${sw.elapsedMilliseconds}мс)',
-    );
+    LogService().add(S.windowCloseLog(sw.elapsedMilliseconds));
     await windowManager.destroy();
   }
 
-  static const List<Widget> _screens = [
+  // Не const: при смене языка экземпляры пересоздаются и экраны перерисовываются.
+  List<Widget> get _screens => [
     ConnectScreen(),
     LogsScreen(),
     InfoScreen(),
@@ -105,6 +113,71 @@ class _MainLayoutState extends State<MainLayout> with WindowListener {
   @override
   void onWindowRestore() {
     AppVisibility.instance.setVisible(true);
+  }
+
+  @override
+  void onWindowFocus() {
+    // Окно могли показать нативно (второй экземпляр/заглушка шлют
+    // именованное событие) — при активации видимость восстанавливаем,
+    // иначе анимация фона остаётся на паузе, как в трее.
+    AppVisibility.instance.setVisible(true);
+    AppVisibility.instance.setFocused(true);
+  }
+
+  @override
+  void onWindowBlur() {
+    // Окно видно, но пользователь работает в другом приложении:
+    // фон и повторяющиеся анимации не тратят GPU.
+    AppVisibility.instance.setFocused(false);
+  }
+
+  void _selectScreen(int index) {
+    if (index == _selectedIndex || index < 0 || index >= _screens.length) {
+      return;
+    }
+    setState(() => _selectedIndex = index);
+  }
+
+  void _cycleScreen(int delta) {
+    final count = _screens.length;
+    _selectScreen((_selectedIndex + delta + count) % count);
+  }
+
+  // Ctrl+1..4 — прямой выбор раздела, Ctrl+Tab / Ctrl+Shift+Tab — по кругу.
+  // Слушаем HardwareKeyboard, а не Shortcuts: так шорткаты работают даже если
+  // фокус сейчас в текстовом поле или его только что сняли.
+  static final Map<LogicalKeyboardKey, int> _screenKeys = {
+    LogicalKeyboardKey.digit1: 0,
+    LogicalKeyboardKey.numpad1: 0,
+    LogicalKeyboardKey.digit2: 1,
+    LogicalKeyboardKey.numpad2: 1,
+    LogicalKeyboardKey.digit3: 2,
+    LogicalKeyboardKey.numpad3: 2,
+    LogicalKeyboardKey.digit4: 3,
+    LogicalKeyboardKey.numpad4: 3,
+  };
+
+  bool _handleKey(KeyEvent event) {
+    if (!mounted || event is KeyUpEvent) return false;
+
+    final keyboard = HardwareKeyboard.instance;
+    if (!keyboard.isControlPressed) return false;
+
+    // Поверх диалога/шита шорткаты не должны менять экран под ним.
+    if (Navigator.of(context).canPop()) return false;
+
+    final screen = _screenKeys[event.logicalKey];
+    if (screen != null) {
+      _selectScreen(screen);
+      return true;
+    }
+
+    if (event.logicalKey == LogicalKeyboardKey.tab) {
+      _cycleScreen(keyboard.isShiftPressed ? -1 : 1);
+      return true;
+    }
+
+    return false;
   }
 
   @override
@@ -123,10 +196,7 @@ class _MainLayoutState extends State<MainLayout> with WindowListener {
                   children: [
                     SideBar(
                       selectedIndex: _selectedIndex,
-                      onIndexChanged: (index) {
-                        if (index == _selectedIndex) return;
-                        setState(() => _selectedIndex = index);
-                      },
+                      onIndexChanged: _selectScreen,
                     ),
                     Expanded(
                       child: AnimatedSwitcher(
@@ -134,22 +204,9 @@ class _MainLayoutState extends State<MainLayout> with WindowListener {
                         switchInCurve: Curves.easeOutQuad,
                         switchOutCurve: Curves.easeInQuad,
                         transitionBuilder: (child, animation) {
-                          return AnimatedBuilder(
-                            animation: animation,
+                          return FadeTransition(
+                            opacity: animation,
                             child: child,
-                            builder: (context, child) {
-                              final blur = (1 - animation.value) * 8;
-                              return ImageFiltered(
-                                imageFilter: ImageFilter.blur(
-                                  sigmaX: blur,
-                                  sigmaY: blur,
-                                ),
-                                child: FadeTransition(
-                                  opacity: animation,
-                                  child: child,
-                                ),
-                              );
-                            },
                           );
                         },
                         child: KeyedSubtree(

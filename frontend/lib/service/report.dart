@@ -1,4 +1,4 @@
-﻿// SPDX-FileCopyrightText: 2026 luminescq
+// SPDX-FileCopyrightText: 2026 luminescq
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 import 'dart:io';
 
@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 
 import '../models/server_profile.dart';
+import '../l10n/app_locale.dart';
 import 'autostart.dart';
 import 'connect.dart';
 import 'db.dart';
@@ -28,38 +29,43 @@ class ReportService {
 
     final StringBuffer sb = StringBuffer();
     sb.writeln('=== FOCSQ Diagnostic Report ===');
-    sb.writeln('App Version: ${packageInfo.version}+${packageInfo.buildNumber}');
+    sb.writeln(
+      'App Version: ${packageInfo.version}+${packageInfo.buildNumber}',
+    );
     sb.writeln('OS: ${Platform.operatingSystem} ${_cleanOsVersion()}');
     sb.writeln('Locale: ${Platform.localeName}');
     sb.writeln('Processors: ${Platform.numberOfProcessors}');
     sb.writeln('---');
-    sb.writeln('Автозапуск: ${_describeAutostart(autostartEnabled)}');
+    sb.writeln(S.reportAutostartLine(S.reportAutostartState(autostartEnabled)));
 
     if (Platform.isLinux) {
       sb.writeln('---');
-      sb.writeln('Linux-окружение:');
+      sb.writeln(S.reportLinuxEnv);
       for (final line in _linuxEnvironment()) {
         sb.writeln('- $line');
       }
     }
 
     sb.writeln('---');
-    sb.writeln('Подключение:');
-    sb.writeln('- Состояние: ${connect.state.name}');
+    sb.writeln(S.reportConnectionSection);
+    sb.writeln(S.reportStateLine(connect.state.name));
     final stats = connect.stats;
     sb.writeln(
-      '- Потоки: ${stats.activeWorkers} | Отдано: ${_formatBytes(stats.bytesUp)} | '
-      'Получено: ${_formatBytes(stats.bytesDown)}',
+      S.reportStreamsLine(
+        stats.activeWorkers,
+        _formatBytes(stats.bytesUp),
+        _formatBytes(stats.bytesDown),
+      ),
     );
     if (connect.lastError != null) {
-      sb.writeln('- Последняя ошибка: ${connect.lastError}');
+      sb.writeln(S.reportLastErrorLine(connect.lastError!));
     }
 
     sb.writeln('---');
-    sb.writeln('Профили: ${profiles.length}');
+    sb.writeln(S.reportProfilesLine(profiles.length));
     if (active != null) {
       sb.writeln(_describeProfile(active, isActive: true));
-      sb.writeln('Активный профиль указан первым.');
+      sb.writeln(S.reportActiveFirst);
     }
     for (final profile in profiles) {
       if (profile.id == active?.id) continue;
@@ -69,7 +75,7 @@ class ReportService {
     final logs = LogService().lines;
     if (logs.isNotEmpty) {
       sb.writeln('---');
-      sb.writeln('Журнал (последние $_logTailLines строк):');
+      sb.writeln(S.reportLogTail(_logTailLines));
       final tail = logs.length > _logTailLines
           ? logs.sublist(logs.length - _logTailLines)
           : logs;
@@ -81,18 +87,18 @@ class ReportService {
     return sb.toString();
   }
 
-  static String _describeProfile(ServerProfile profile, {bool isActive = false}) {
-    final marker = isActive ? '[активный] ' : '';
-    return '- $marker${profile.name ?? "Без имени"}: '
-        '${profile.ip ?? "?"}:${profile.port ?? "?"}, '
-        'потоков: ${profile.power ?? "?"}';
+  static String _describeProfile(
+    ServerProfile profile, {
+    bool isActive = false,
+  }) {
+    return S.reportProfile(
+      profile.name ?? S.unnamedProfile,
+      profile.ip ?? '?',
+      '${profile.port ?? "?"}',
+      '${profile.power ?? "?"}',
+      isActive,
+    );
   }
-
-  static String _describeAutostart(bool? enabled) {
-    if (enabled == null) return 'не поддерживается на этой платформе';
-    return enabled ? 'включён' : 'выключен';
-  }
-
 
   static List<String> _linuxEnvironment() {
     final lines = <String>[];
@@ -100,33 +106,25 @@ class ReportService {
 
     final tun = File('/dev/net/tun').statSync();
     if (tun.type == FileSystemEntityType.notFound) {
-      lines.add('/dev/net/tun: отсутствует (модуль ядра tun не загружен?)');
+      lines.add(S.reportTunMissing);
     } else {
-      lines.add('/dev/net/tun: есть (${tun.modeString})');
+      lines.add(S.reportTunPresent(tun.modeString()));
     }
 
-    lines.add('Права: ${_describeLinuxCaps()}');
+    lines.add(S.reportCapsLine(_describeLinuxCaps()));
 
     final viaLauncher = env['FOCSQ_LAUNCHER'] == '1';
-    lines.add(
-      viaLauncher
-          ? 'Лаунчер: да (проверки библиотек и права TUN выполнялись)'
-          : 'Лаунчер: нет — запущен бинарник напрямую, запускай focsq.sh',
-    );
+    lines.add(viaLauncher ? S.reportLauncherYes : S.reportLauncherNo);
 
     final systemdResolved = Directory('/run/systemd/resolve').existsSync();
-    lines.add(
-      systemdResolved
-          ? 'DNS: systemd-resolved (переключение через resolvectl)'
-          : 'DNS: без systemd-resolved (будет перезаписан /etc/resolv.conf)',
-    );
+    lines.add(systemdResolved ? S.reportDnsResolved : S.reportDnsPlain);
 
-    final desktop = (env['XDG_CURRENT_DESKTOP'] ?? 'неизвестен').trim();
-    final session = (env['XDG_SESSION_TYPE'] ?? 'неизвестна').trim();
+    final desktop = (env['XDG_CURRENT_DESKTOP'] ?? S.reportUnknownValue).trim();
+    final session = (env['XDG_SESSION_TYPE'] ?? S.reportUnknownValue).trim();
     final gnomeHint = desktop.toUpperCase().contains('GNOME')
-        ? ' — для трея нужно расширение AppIndicator'
+        ? S.reportGnomeHint
         : '';
-    lines.add('Рабочий стол: $desktop, сессия $session$gnomeHint');
+    lines.add(S.reportDesktopLine(desktop, session, gnomeHint));
 
     return lines;
   }
@@ -135,15 +133,15 @@ class ReportService {
     try {
       final status = File('/proc/self/status').readAsStringSync();
       final uid = parseEffectiveUid(status);
-      if (uid == 0) return 'root — туннель доступен';
+      if (uid == 0) return S.reportCapsRoot;
       if (parseHasCapNetAdmin(status)) {
-        return 'CAP_NET_ADMIN есть (через focsq-tun/лаунчер) — туннель доступен';
+        return S.reportCapsGranted;
       }
       if (uid != null) {
-        return 'обычный пользователь (uid $uid), CAP_NET_ADMIN нет — запусти через focsq.sh (выдаст право на focsq-tun)';
+        return S.reportCapsUser(uid);
       }
     } catch (_) {}
-    return 'неизвестны — /proc/self/status не прочитан';
+    return S.reportCapsUnknown;
   }
 
   static String parsePrettyName(String osRelease) {
@@ -174,8 +172,10 @@ class ReportService {
     const capNetAdminBit = 12;
     for (final line in procStatus.split('\n')) {
       if (!line.startsWith('CapEff:')) continue;
-      final caps =
-          BigInt.tryParse(line.substring('CapEff:'.length).trim(), radix: 16);
+      final caps = BigInt.tryParse(
+        line.substring('CapEff:'.length).trim(),
+        radix: 16,
+      );
       return caps != null &&
           (caps >> capNetAdminBit) & BigInt.one == BigInt.one;
     }
@@ -193,23 +193,25 @@ class ReportService {
   }
 
   static String _formatBytes(int bytes) {
-    if (bytes < 1024) return '$bytes Б';
-    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} КБ';
+    if (bytes < 1024) return '$bytes ${S.unitB}';
+    if (bytes < 1024 * 1024)
+      return '${(bytes / 1024).toStringAsFixed(1)} ${S.unitKB}';
     if (bytes < 1024 * 1024 * 1024) {
-      return '${(bytes / 1024 / 1024).toStringAsFixed(1)} МБ';
+      return '${(bytes / 1024 / 1024).toStringAsFixed(1)} ${S.unitMB}';
     }
-    return '${(bytes / 1024 / 1024 / 1024).toStringAsFixed(2)} ГБ';
+    return '${(bytes / 1024 / 1024 / 1024).toStringAsFixed(2)} ${S.unitGB}';
   }
 
   static String _cleanOsVersion() {
     final raw = Platform.operatingSystemVersion;
     if (Platform.isLinux) {
       try {
-        final distro =
-            parsePrettyName(File('/etc/os-release').readAsStringSync());
-        if (distro.isNotEmpty) return '$distro (ядро $raw)';
+        final distro = parsePrettyName(
+          File('/etc/os-release').readAsStringSync(),
+        );
+        if (distro.isNotEmpty) return '$distro (${S.reportKernel(raw)})';
       } catch (_) {}
-      return 'ядро $raw';
+      return S.reportKernel(raw);
     }
     if (Platform.isWindows) {
       final buildMatch = RegExp(r'Build\s+(\d+)').firstMatch(raw);

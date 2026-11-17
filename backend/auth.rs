@@ -70,6 +70,50 @@ impl std::fmt::Display for CallUnavailable {
 
 impl std::error::Error for CallUnavailable {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VkRateLimitType {
+    FloodControl,
+    RateLimit,
+    CaptchaLimit,
+}
+
+#[derive(Debug, Clone)]
+pub struct VkRateLimitError {
+    pub limit_type: VkRateLimitType,
+    pub code: i64,
+    pub message: String,
+    pub cooldown: Duration,
+}
+
+impl std::fmt::Display for VkRateLimitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.limit_type {
+            VkRateLimitType::FloodControl => write!(
+                formatter,
+                "Ваш IP-адрес сети получил Flood ограничение (error_code={}) — режимы работы Капча и Авто временно заблокированы VK. Пауза {} секунд до следующей попытки. Пожалуйста, включите пока что режим Авто ВК. ({})",
+                self.code,
+                self.cooldown.as_secs(),
+                self.message
+            ),
+            VkRateLimitType::RateLimit => write!(
+                formatter,
+                "Превышен лимит запросов VK (Rate limit: error_code={}). Пауза {} секунд до следующей попытки. ({})",
+                self.code,
+                self.cooldown.as_secs(),
+                self.message
+            ),
+            VkRateLimitType::CaptchaLimit => write!(
+                formatter,
+                "Превышен лимит сессии капчи VK (Captcha error_limit). Пауза {} секунд до следующей попытки. ({})",
+                self.cooldown.as_secs(),
+                self.message
+            ),
+        }
+    }
+}
+
+impl std::error::Error for VkRateLimitError {}
+
 pub struct VkAuth {
     mode: Arc<str>,
     auto_js: Option<Arc<CredentialBroker>>,
@@ -77,6 +121,7 @@ pub struct VkAuth {
     credentials: Arc<[VkCredentials]>,
     captcha: Arc<CaptchaSolver>,
     captcha_lockout_until: AtomicI64,
+    rate_limit_lockout_until: AtomicI64,
 }
 
 struct LegacyAttempt<'a> {
@@ -108,6 +153,7 @@ impl VkAuth {
             credentials: load_credentials(client_ids).into(),
             captcha,
             captcha_lockout_until: AtomicI64::new(0),
+            rate_limit_lockout_until: AtomicI64::new(0),
         }
     }
 
@@ -149,8 +195,28 @@ impl VkAuth {
                 }
             };
         }
-        if unix_seconds() < self.captcha_lockout_until.load(Ordering::Acquire) {
-            bail!("CAPTCHA_WAIT_REQUIRED: global lockout active");
+        let now = unix_seconds();
+        let rate_lockout = self.rate_limit_lockout_until.load(Ordering::Acquire);
+        if now < rate_lockout {
+            let remaining = (rate_lockout - now) as u64;
+            return Err(VkRateLimitError {
+                limit_type: VkRateLimitType::RateLimit,
+                code: 0,
+                message: "активна глобальная пауза лимита запросов".to_string(),
+                cooldown: Duration::from_secs(remaining.max(1)),
+            }
+            .into());
+        }
+        let captcha_lockout = self.captcha_lockout_until.load(Ordering::Acquire);
+        if now < captcha_lockout {
+            let remaining = (captcha_lockout - now) as u64;
+            return Err(VkRateLimitError {
+                limit_type: VkRateLimitType::CaptchaLimit,
+                code: 14,
+                message: "активна глобальная пауза капчи".to_string(),
+                cooldown: Duration::from_secs(remaining.max(1)),
+            }
+            .into());
         }
         if self.mode.as_ref() == "vkcalls" {
             // [FOCSQ] Режим «Звонки» не использует капчу вовсе: fallback на
@@ -164,6 +230,9 @@ impl VkAuth {
                 match self.vk_calls_with_retries(link, stream_id).await {
                     Ok(credentials) => return Ok(credentials),
                     Err(error) if error.downcast_ref::<CallUnavailable>().is_some() => {
+                        return Err(error);
+                    }
+                    Err(error) if error.downcast_ref::<VkRateLimitError>().is_some() => {
                         return Err(error);
                     }
                     Err(error) => {
@@ -234,10 +303,23 @@ impl VkAuth {
                         "[STREAM {stream_id}] [VK Auth] Failed with client_id={}: {error}",
                         credential.client_id
                     );
+                    if let Some(limit) = error.downcast_ref::<VkRateLimitError>() {
+                        self.rate_limit_lockout_until.store(
+                            unix_seconds() + limit.cooldown.as_secs() as i64,
+                            Ordering::Release,
+                        );
+                        return Err(error);
+                    }
                     if error.to_string().contains("CAPTCHA_WAIT_REQUIRED") {
                         self.captcha_lockout_until
                             .store(unix_seconds() + 60, Ordering::Release);
-                        return Err(error);
+                        return Err(VkRateLimitError {
+                            limit_type: VkRateLimitType::CaptchaLimit,
+                            code: 14,
+                            message: "captcha wait required".to_string(),
+                            cooldown: Duration::from_secs(60),
+                        }
+                        .into());
                     }
                     last_error = Some(error);
                 }
@@ -266,7 +348,19 @@ impl VkAuth {
                 Err(error) if error.downcast_ref::<CallUnavailable>().is_some() => {
                     return Err(error);
                 }
+                Err(error) if error.downcast_ref::<VkRateLimitError>().is_some() => {
+                    if let Some(limit) = error.downcast_ref::<VkRateLimitError>() {
+                        self.rate_limit_lockout_until.store(
+                            unix_seconds() + limit.cooldown.as_secs() as i64,
+                            Ordering::Release,
+                        );
+                    }
+                    return Err(error);
+                }
                 Err(error) => {
+                    if is_network_or_dns_error(&error) {
+                        return Err(error);
+                    }
                     last_error = Some(error);
                     if attempt < 2 {
                         random_delay(300, 500).await;
@@ -296,6 +390,7 @@ impl VkAuth {
             "https://{VK_CALLS_API_HOST}/method/auth.getAnonymToken?v={VK_CALLS_API_VERSION}&client_id={VK_CONNECT_CLIENT_ID}&link={link_url}&device_id={device_id}&anonymName={name_encoded}&lang=en"
         );
         let response1 = post_empty(&client, &step1, &profile).await?;
+        check_vk_error(&response1)?;
         let anonymous_token = json_string(&response1, &["response", "token"])?;
         let anonymous_token_encoded = query_escape(anonymous_token);
         crate::log_error!(
@@ -535,6 +630,24 @@ fn classify_vk_hash_error(response: &Value) -> Result<Option<VkHashCheck>> {
     if code == 14 {
         return Ok(Some(VkHashCheck::Valid));
     }
+    if is_vk_flood_control(code, &message) {
+        return Err(VkRateLimitError {
+            limit_type: VkRateLimitType::FloodControl,
+            code,
+            message,
+            cooldown: Duration::from_secs(60),
+        }
+        .into());
+    }
+    if is_vk_rate_limit(code, &message) {
+        return Err(VkRateLimitError {
+            limit_type: VkRateLimitType::RateLimit,
+            code,
+            message,
+            cooldown: Duration::from_secs(60),
+        }
+        .into());
+    }
     bail!("VK API error: error_code={code} {message}")
 }
 
@@ -716,23 +829,65 @@ async fn post_form(
     })
 }
 
+fn is_vk_flood_control(code: i64, message: &str) -> bool {
+    code == 9 || code == 7 || message.to_ascii_lowercase().contains("flood control")
+}
+
+fn is_vk_rate_limit(code: i64, message: &str) -> bool {
+    code == 6
+        || code == 29
+        || message.to_ascii_lowercase().contains("too many requests")
+        || message.to_ascii_lowercase().contains("rate limit")
+}
+
+fn is_network_or_dns_error(error: &anyhow::Error) -> bool {
+    let lower = format!("{error:#}").to_ascii_lowercase();
+    [
+        "dns",
+        "connect",
+        "connection",
+        "timed out",
+        "timeout",
+        "network",
+        "unreachable",
+        "reset",
+        "broken pipe",
+        "io error",
+        "os error",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
 fn check_vk_error(response: &Value) -> Result<()> {
     let Some(error) = response.get("error") else {
         return Ok(());
     };
     check_fatal_call(response)?;
-    if error_code(error.get("error_code")) == 14 {
+    let code = error_code(error.get("error_code"));
+    if code == 14 {
         return Err(VkCaptchaError::from_json(error)?.into());
     }
-    let code = error_code(error.get("error_code"));
-    bail!(
-        "VK API error: error_code={} {}",
-        code,
-        error
-            .get("error_msg")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-    )
+    let message = vk_error_message(error).to_owned();
+    if is_vk_flood_control(code, &message) {
+        return Err(VkRateLimitError {
+            limit_type: VkRateLimitType::FloodControl,
+            code,
+            message,
+            cooldown: Duration::from_secs(60),
+        }
+        .into());
+    }
+    if is_vk_rate_limit(code, &message) {
+        return Err(VkRateLimitError {
+            limit_type: VkRateLimitType::RateLimit,
+            code,
+            message,
+            cooldown: Duration::from_secs(60),
+        }
+        .into());
+    }
+    bail!("VK API error: error_code={code} {message}")
 }
 
 fn check_fatal_call(response: &Value) -> Result<()> {
@@ -773,15 +928,29 @@ fn vk_error_message(error: &Value) -> &str {
 fn check_ok_error(response: &Value) -> Result<()> {
     let code = error_code(response.get("error_code"));
     if code != 0 {
-        let message = vk_error_message(response);
-        if is_fatal_call_error(code, message) {
-            return Err(CallUnavailable {
+        let message = vk_error_message(response).to_owned();
+        if is_fatal_call_error(code, &message) {
+            return Err(CallUnavailable { code, message }.into());
+        }
+        if is_vk_flood_control(code, &message) {
+            return Err(VkRateLimitError {
+                limit_type: VkRateLimitType::FloodControl,
                 code,
-                message: message.to_owned(),
+                message,
+                cooldown: Duration::from_secs(60),
             }
             .into());
         }
-        bail!("OK CDN API error: error_code={code} {}", message);
+        if is_vk_rate_limit(code, &message) {
+            return Err(VkRateLimitError {
+                limit_type: VkRateLimitType::RateLimit,
+                code,
+                message,
+                cooldown: Duration::from_secs(60),
+            }
+            .into());
+        }
+        bail!("OK CDN API error: error_code={code} {message}");
     }
     Ok(())
 }
@@ -801,6 +970,18 @@ fn error_code(value: Option<&Value>) -> i64 {
 pub(crate) fn parse_turn_credentials(response: &Value) -> Result<TurnCredentials> {
     let turn = response
         .get("turn_server")
+        .or_else(|| {
+            response
+                .get("turn_servers")
+                .and_then(Value::as_array)
+                .and_then(|servers| servers.first())
+        })
+        .or_else(|| {
+            response
+                .get("iceServers")
+                .and_then(Value::as_array)
+                .and_then(|servers| servers.first())
+        })
         .context("missing turn_server in response")?;
     let username: Arc<str> = Arc::from(
         turn.get("username")
@@ -809,19 +990,32 @@ pub(crate) fn parse_turn_credentials(response: &Value) -> Result<TurnCredentials
     );
     let password: Arc<str> = Arc::from(
         turn.get("credential")
+            .or_else(|| turn.get("password"))
             .and_then(Value::as_str)
             .context("missing credential in turn_server")?,
     );
-    let addresses: Vec<Arc<str>> = turn
+    let mut addresses: Vec<Arc<str>> = Vec::new();
+    if let Some(urls_arr) = turn.get("urls").and_then(Value::as_array) {
+        for u in urls_arr.iter().filter_map(Value::as_str).map(str::trim) {
+            if crate::turn_endpoint::is_supported_turn_uri(u) {
+                addresses.push(Arc::from(u));
+            }
+        }
+    } else if let Some(u) = turn
         .get("urls")
-        .and_then(Value::as_array)
-        .context("missing or empty urls in turn_server")?
-        .iter()
-        .filter_map(Value::as_str)
+        .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|value| crate::turn_endpoint::is_supported_turn_uri(value))
-        .map(Arc::from)
-        .collect();
+        .filter(|&u| crate::turn_endpoint::is_supported_turn_uri(u))
+    {
+        addresses.push(Arc::from(u));
+    } else if let Some(u) = turn
+        .get("url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|&u| crate::turn_endpoint::is_supported_turn_uri(u))
+    {
+        addresses.push(Arc::from(u));
+    }
     if addresses.is_empty() {
         bail!("no valid TURN addresses found");
     }
@@ -1016,6 +1210,40 @@ mod tests {
             }
         });
         assert!(classify_vk_hash_error(&response).is_err());
+    }
+
+    #[test]
+    fn vk_errors_flood_control_and_rate_limits_are_classified_as_vk_rate_limit_errors() {
+        for (code, msg, expected_type) in [
+            (
+                6,
+                "Too many requests per second",
+                VkRateLimitType::RateLimit,
+            ),
+            (
+                7,
+                "Permission to perform this action is denied: flood control",
+                VkRateLimitType::FloodControl,
+            ),
+            (9, "Flood control", VkRateLimitType::FloodControl),
+            (29, "Rate limit reached", VkRateLimitType::RateLimit),
+        ] {
+            let response = serde_json::json!({
+                "error": {
+                    "error_code": code,
+                    "error_msg": msg
+                }
+            });
+            let err = check_vk_error(&response).unwrap_err();
+            let limit = err
+                .downcast_ref::<VkRateLimitError>()
+                .expect("must be VkRateLimitError");
+            assert_eq!(limit.limit_type, expected_type);
+            assert_eq!(limit.code, code);
+            assert_eq!(limit.cooldown, Duration::from_secs(60));
+            assert!(err.to_string().contains(&code.to_string()));
+            assert!(!err.to_string().contains("CAPTCHA_WAIT_REQUIRED"));
+        }
     }
 
     #[test]

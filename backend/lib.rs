@@ -1,4 +1,4 @@
-﻿// SPDX-FileCopyrightText: 2026 amurcanov
+// SPDX-FileCopyrightText: 2026 amurcanov
 // SPDX-FileCopyrightText: 2026 luminescq
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
@@ -10,45 +10,55 @@
 mod auth;
 mod captcha;
 mod captcha_slider;
+mod direct_relay;
 mod dispatcher;
 mod dns;
+mod dtls;
 mod events;
 mod logging;
 mod namegen;
 mod obfs;
 mod packet;
 mod profiles;
-mod repair;
 mod protocol;
+mod repair;
 #[path = "shared/selective_fec.rs"]
 mod selective_fec;
 mod session;
+mod sni;
+mod spsc_ring;
+mod srtp_mode;
 mod stats;
 #[path = "shared/striped_scheduler.rs"]
 mod striped_scheduler;
 mod stun_codec;
-mod turn_endpoint;
-mod turn_stream;
-mod udp_batch;
 #[cfg(target_os = "linux")]
 // [FOCSQ] Нативный Linux TUN (/dev/net/tun + netlink-маршруты)
 pub mod tun_linux;
-mod turn;
-mod turn_core;
- mod vk_js_calls;
 #[cfg(windows)]
 // [FOCSQ] pub: мост (rust_lib_frontend) вызывает set_dll_path_override
 pub mod tun_win;
+mod turn;
+mod turn_core;
+mod turn_endpoint;
+mod turn_stream;
+mod udp_batch;
+mod vk_js_calls;
 mod worker;
 mod wrap;
 // [FOCSQ] Общие модули апстрима v2.1.9 (shared/): кадрирование потоков
 // и ревизия wire-протокола нужны новому диспетчеру/сессиям
+// [FOCSQ] После перехода wire-слоя на апстримные фрагменты 0xCF (v2.5.0)
+// из flow_frame в клиенте осталась только payload()/классификация
+// (striped_scheduler/selective_fec). FlowSequencer/FlowReassembler —
+// под будущий сервер FOCSQ, поэтому гасим dead_code на весь модуль.
+mod client_perf;
+mod cpu_task;
+#[allow(dead_code)]
 #[path = "shared/flow_frame.rs"]
 mod flow_frame;
 #[path = "shared/wire_protocol.rs"]
 mod wire_protocol;
-mod client_perf;
-mod cpu_task;
 
 use anyhow::{Context, Result, bail};
 use auth::{VkAuth, VkHashCheck};
@@ -57,28 +67,29 @@ use dispatcher::Dispatcher;
 use events::Events;
 use obfs::ObfsMode;
 use packet::{PacketPool, packet_pool_size};
+use repair::RepairState;
+use session::ShutdownCoordinator;
+use srtp_mode::SrtpMode;
 use stats::Stats;
 use std::{
     collections::HashSet,
     net::SocketAddr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
-use repair::RepairState;
-use session::ShutdownCoordinator;
 use turn_endpoint::TurnTransportMode;
 use worker::{
     GROUPS_PER_CREDENTIAL, GroupContext, PauseGate, RuntimeParams, WORKER_START_INTERVAL,
     WORKERS_PER_GROUP, WorkerStartPacer, parse_hashes, run_groups,
 };
 
-const GROUPS_PER_VK_HASH: usize = 3;
 const MAX_VK_HASHES: usize = 6;
-const MAX_WORKERS: usize = MAX_VK_HASHES * GROUPS_PER_VK_HASH * WORKERS_PER_GROUP;
+const MAX_WORKERS: usize = 100;
 use wrap::derive_wrap_key;
 
 #[derive(Clone, Debug)]
@@ -103,6 +114,14 @@ pub struct ClientConfig {
     pub tun_uds: String,
     pub validate_vk_hashes: bool,
     pub vk_js_token: String,
+    pub domain_routing: bool,
+    pub exclude_ru_zones: bool,
+    pub template_domains: bool,
+    pub domain_whitelist: bool,
+    pub direct_domains: String,
+    pub ip_routing: bool,
+    pub ip_whitelist: bool,
+    pub direct_ips: String,
 }
 
 impl Default for ClientConfig {
@@ -128,6 +147,14 @@ impl Default for ClientConfig {
             tun_uds: "".to_string(),
             validate_vk_hashes: false,
             vk_js_token: "".to_string(),
+            domain_routing: false,
+            exclude_ru_zones: false,
+            template_domains: false,
+            domain_whitelist: false,
+            direct_domains: "".to_string(),
+            ip_routing: false,
+            ip_whitelist: false,
+            direct_ips: "".to_string(),
         }
     }
 }
@@ -146,8 +173,7 @@ pub fn set_events_enabled(enabled: bool) {
 }
 
 /// Канал управления активной сессией (замена stdin для встроенного режима)
-static CONTROL_TX: Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>> =
-    Mutex::new(None);
+static CONTROL_TX: Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>> = Mutex::new(None);
 
 fn set_control_channel(tx: tokio::sync::mpsc::UnboundedSender<String>) {
     if let Ok(mut guard) = CONTROL_TX.lock() {
@@ -202,7 +228,10 @@ pub fn submit_captcha_result(result: String) -> bool {
     }
 }
 
-pub async fn run_client(arguments: ClientConfig, external_cancel: Option<CancellationToken>) -> Result<()> {
+pub async fn run_client(
+    arguments: ClientConfig,
+    external_cancel: Option<CancellationToken>,
+) -> Result<()> {
     if arguments.validate_vk_hashes {
         return run_vk_hash_validation(&arguments).await;
     }
@@ -230,9 +259,13 @@ pub async fn run_client(arguments: ClientConfig, external_cancel: Option<Cancell
         let bootstrap = vk_js_calls::Bootstrap {
             token: arguments.vk_js_token.trim().to_owned(),
         };
-        let started =
-            vk_js_calls::start(bootstrap, &arguments.device_id, js_auth_mode, &session_profile)
-                .await?;
+        let started = vk_js_calls::start(
+            bootstrap,
+            &arguments.device_id,
+            js_auth_mode,
+            &session_profile,
+        )
+        .await?;
         let hashes = started.hashes.join(",");
         js_calls = Some(started.active);
         js_credential_broker = Some(started.credential_broker);
@@ -247,12 +280,9 @@ pub async fn run_client(arguments: ClientConfig, external_cancel: Option<Cancell
     if hashes.is_empty() {
         bail!("[КЛИЕНТ] Нет хешей VK");
     }
-    let workers = normalize_worker_count_for_hashes(
-        arguments.workers,
-        hashes.len(),
-        arguments.allow_hash_redistribution || js_hash_mode,
-    );
-    let groups = workers / WORKERS_PER_GROUP;
+    let configured_workers = normalize_worker_count(arguments.workers);
+    let workers = Arc::new(AtomicUsize::new(configured_workers));
+    let groups = configured_workers.div_ceil(WORKERS_PER_GROUP);
     let cancel = external_cancel.unwrap_or_else(CancellationToken::new);
     // [FOCSQ] VK API — CDN с ротацией IP: резолвим хосты сразу (пока DNS
     // не перехвачен) и повторяем в течение сессии, добавляя свежие адреса
@@ -297,7 +327,7 @@ pub async fn run_client(arguments: ClientConfig, external_cancel: Option<Cancell
     );
     let parent_task = start_parent_monitor(cancel.clone());
     events.process(std::process::id());
-    let pool = PacketPool::new(packet_pool_size(workers));
+    let pool = PacketPool::new(packet_pool_size(configured_workers));
     let tun_uds = (!arguments.tun_uds.is_empty()).then_some(arguments.tun_uds.clone());
     // [FOCSQ] Нативный TUN: ядро само создаёт интерфейс и применяет TUNCONF.
     // Windows — «wintun», Linux — «tun» (имя интерфейса по умолчанию csqtt).
@@ -308,12 +338,25 @@ pub async fn run_client(arguments: ClientConfig, external_cancel: Option<Cancell
     #[cfg(not(any(windows, target_os = "linux")))]
     let native_tun = false;
     let tun_peer_ip = native_tun.then(|| peer.ip().to_string());
-    let dispatcher_result = Dispatcher::start(
+    let mut direct_domains = sni::parse_direct_domains(&arguments.direct_domains);
+    direct_domains.truncate(1024);
+    let domain_routing = dispatcher::DomainRoutingConfig {
+        enabled: arguments.domain_routing,
+        exclude_ru_zones: arguments.exclude_ru_zones,
+        template_domains: arguments.template_domains,
+        direct_domains: Arc::new(direct_domains),
+        is_whitelist: arguments.domain_whitelist,
+        ip_routing_enabled: arguments.ip_routing,
+        ip_is_whitelist: arguments.ip_whitelist,
+        ip_rules: Arc::new(sni::parse_ip_rules(&arguments.direct_ips)),
+    };
+    let dispatcher_result = Dispatcher::start_with_domain_routing(
         &arguments.listen,
         tun_uds,
         pool.clone(),
         stats.clone(),
         cancel.clone(),
+        domain_routing,
     )
     .await;
     let (dispatcher, local_port) = match dispatcher_result {
@@ -336,6 +379,7 @@ pub async fn run_client(arguments: ClientConfig, external_cancel: Option<Cancell
         turn_transport,
         hashes: hashes.into(),
         wrap_key,
+        srtp_mode: SrtpMode::Auto,
         mode,
         generation: arguments.generation,
         salt: Arc::from(arguments.salt.as_str()),
@@ -343,17 +387,20 @@ pub async fn run_client(arguments: ClientConfig, external_cancel: Option<Cancell
         device_id: Arc::from(arguments.device_id.as_str()),
         password: Arc::from(arguments.password.as_str()),
         workers,
+        configured_workers,
     });
     print_configuration(
         &arguments,
         auth.client_ids(),
-        workers,
+        configured_workers,
         groups,
         params.hashes.len(),
         &local_port,
         params.turn_transport,
     );
-    let repair = RepairState::new(workers);
+    // Сервер может поднять target через TUNWORKERS выше configured_workers:
+    // слоты нужны для всех worker id вплоть до MAX_WORKERS.
+    let repair = RepairState::new(MAX_WORKERS);
     let stats_task = tokio::spawn(stats.clone().run(events.clone(), cancel.clone()));
     let (config_tx, mut config_rx) = tokio::sync::mpsc::channel::<String>(32);
     let config_events = events.clone();
@@ -423,6 +470,7 @@ pub async fn run_client(arguments: ClientConfig, external_cancel: Option<Cancell
         repair,
         shutdown: Arc::new(ShutdownCoordinator::new()),
         cancel: cancel.clone(),
+        scale_notify: Arc::new(Notify::new()),
     });
     let required_ready_bots = required_js_ready_bots(groups);
     if js_auth_mode {
@@ -438,7 +486,7 @@ pub async fn run_client(arguments: ClientConfig, external_cancel: Option<Cancell
         _ => None,
     };
     let shutdown_events = events.clone();
-    let groups_future = run_groups(groups, context);
+    let groups_future = run_groups(context);
     tokio::pin!(groups_future);
     let groups_completed = tokio::select! {
         _ = &mut groups_future => true,
@@ -483,10 +531,22 @@ pub async fn run_client(arguments: ClientConfig, external_cancel: Option<Cancell
         let _ = task.await;
     }
     if let Some(active) = js_calls.take() {
-        if finish_js_calls.load(Ordering::Acquire) {
-            active.finish().await;
-        } else {
-            active.leave_creator().await;
+        // [FOCSQ] Общий лимит на финализацию: внутри HTTP-таймауты 15 с и
+        // ретраи ×3 — без внешнего лимита остановка ядра тянулась до минут
+        // при недоступном VK API (таймаут роняет future, JoinSet внутри
+        // абортит незавершённые запросы).
+        let job = async {
+            if finish_js_calls.load(Ordering::Acquire) {
+                active.finish().await;
+            } else {
+                active.leave_creator().await;
+            }
+        };
+        if tokio::time::timeout(Duration::from_secs(15), job)
+            .await
+            .is_err()
+        {
+            crate::log_error!("[VK JS] Финализация звонков не уложилась в 15 с — пропущена");
         }
     }
     #[cfg(windows)]
@@ -545,19 +605,10 @@ fn required_js_ready_bots(groups: usize) -> usize {
 }
 
 fn normalize_worker_count(requested: usize) -> usize {
-    requested.clamp(WORKERS_PER_GROUP, MAX_WORKERS) / WORKERS_PER_GROUP * WORKERS_PER_GROUP
-}
-
-fn normalize_worker_count_for_hashes(
-    requested: usize,
-    hash_count: usize,
-    allow_hash_redistribution: bool,
-) -> usize {
-    if allow_hash_redistribution {
-        return normalize_worker_count(requested);
+    if requested <= 5 {
+        return 5;
     }
-    let maximum = hash_count.clamp(1, MAX_VK_HASHES) * GROUPS_PER_VK_HASH * WORKERS_PER_GROUP;
-    normalize_worker_count(requested).min(maximum)
+    requested.clamp(WORKERS_PER_GROUP, MAX_WORKERS) / WORKERS_PER_GROUP * WORKERS_PER_GROUP
 }
 
 fn should_leave_js_creator(_js_hash_mode: bool, _js_auth_mode: bool) -> bool {
@@ -778,49 +829,41 @@ mod worker_count_tests {
     use super::*;
 
     #[test]
-    fn every_supported_total_maps_to_complete_nine_allocation_groups() {
+    fn every_supported_total_maps_to_complete_allocation_groups() {
         for groups in 1..=MAX_WORKERS / WORKERS_PER_GROUP {
             let workers = groups * WORKERS_PER_GROUP;
             assert_eq!(normalize_worker_count(workers), workers);
             assert_eq!(workers / WORKERS_PER_GROUP, groups);
         }
-        assert_eq!(normalize_worker_count(MAX_WORKERS), 162);
+        assert_eq!(normalize_worker_count(MAX_WORKERS), 100);
     }
 
     #[test]
     fn invalid_totals_never_create_partial_or_excess_group() {
         for requested in 0..=1_000 {
             let workers = normalize_worker_count(requested);
-            assert!((WORKERS_PER_GROUP..=MAX_WORKERS).contains(&workers));
-            assert_eq!(workers % WORKERS_PER_GROUP, 0);
+            if requested <= 5 {
+                assert_eq!(workers, 5);
+            } else {
+                assert!((WORKERS_PER_GROUP..=MAX_WORKERS).contains(&workers));
+                assert_eq!(workers % WORKERS_PER_GROUP, 0);
+            }
         }
     }
 
     #[test]
-    fn hash_count_caps_native_worker_admission_to_twenty_seven_each() {
-        assert_eq!(normalize_worker_count_for_hashes(usize::MAX, 1, false), 27);
-        assert_eq!(normalize_worker_count_for_hashes(usize::MAX, 4, false), 108);
-        assert_eq!(normalize_worker_count_for_hashes(usize::MAX, 5, false), 135);
-        assert_eq!(normalize_worker_count_for_hashes(usize::MAX, 6, false), 162);
-        assert_eq!(
-            normalize_worker_count_for_hashes(usize::MAX, 100, false),
-            162
-        );
+    fn five_workers_fit_one_partial_group() {
+        assert_eq!(normalize_worker_count(4), 5);
+        assert_eq!(normalize_worker_count(5), 5);
+        assert_eq!(normalize_worker_count(5).div_ceil(WORKERS_PER_GROUP), 1);
     }
 
     #[test]
-    fn automatic_call_failure_may_redistribute_complete_groups() {
-        assert_eq!(normalize_worker_count_for_hashes(162, 5, true), 162);
-        assert_eq!(normalize_worker_count_for_hashes(54, 1, true), 54);
-        assert_eq!(normalize_worker_count_for_hashes(50, 1, true), 45);
-    }
-
-    #[test]
-    fn auto_js_account_auth_supports_nine_credentials_in_one_call() {
-        assert_eq!(normalize_worker_count_for_hashes(162, 1, true), 162);
-        assert_eq!(
-            MAX_WORKERS.div_ceil(worker::WORKERS_PER_CREDENTIAL),
-            vk_js_calls::MAX_ACCOUNT_CREDENTIALS
+    fn auto_js_account_auth_supports_ten_credentials_in_one_call() {
+        assert_eq!(normalize_worker_count(100), 100);
+        assert!(
+            MAX_WORKERS.div_ceil(worker::WORKERS_PER_CREDENTIAL)
+                <= vk_js_calls::MAX_ACCOUNT_CREDENTIALS
         );
     }
 
@@ -835,12 +878,10 @@ mod worker_count_tests {
     #[test]
     fn auto_js_waits_for_at_most_two_independent_turn_bots() {
         assert_eq!(required_js_ready_bots(1), 1);
-        assert_eq!(required_js_ready_bots(2), 1);
+        assert_eq!(required_js_ready_bots(2), 2);
         assert_eq!(required_js_ready_bots(3), 2);
         assert_eq!(required_js_ready_bots(18), 2);
     }
-
-
 
     #[tokio::test]
     async fn js_creator_waits_for_every_distinct_ready_credential() {

@@ -1,8 +1,10 @@
-﻿// SPDX-FileCopyrightText: 2026 luminescq
+// SPDX-FileCopyrightText: 2026 luminescq
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 import 'dart:async';
 import 'package:desktop_webview_window/desktop_webview_window.dart';
 import '../src/rust/api/simple.dart';
+import '../l10n/app_locale.dart';
+import 'webview_data_dir.dart';
 
 class CaptchaService {
   CaptchaService._();
@@ -29,15 +31,15 @@ class CaptchaService {
   }) {
     final parts = line.split('|');
     if (parts.length < 4) {
-      log('[КАПЧА] Некорректный запрос от ядра: $line');
+      log(S.captchaBadRequest(line));
       return;
     }
     if (!clientRunning) {
-      log('[КАПЧА] Клиент остановлен — окно не открываю');
+      log(S.captchaClientStoppedLog);
       return;
     }
     if (_busy) {
-      log('[КАПЧА] Окно уже открыто, параллельный запрос отклонён');
+      log(S.captchaAlreadyOpenLog);
       submitCaptchaResult(result: 'error:busy');
       return;
     }
@@ -60,9 +62,7 @@ class CaptchaService {
     void Function(String message) log,
   ) async {
     final timeout = _timeoutFor(mode);
-    log(
-      '[КАПЧА] WebView($mode): открываю окно решения (${timeout.inSeconds}s)...',
-    );
+    log(S.captchaOpeningLog(mode, timeout.inSeconds));
 
     Webview? webview;
     var finished = false;
@@ -75,9 +75,7 @@ class CaptchaService {
       pollTimer?.cancel();
       final delivered = await submitCaptchaResult(result: result);
       log(
-        delivered
-            ? '[КАПЧА] Результат передан в ядро ($reason)'
-            : '[КАПЧА] Ядро не приняло результат ($reason) — устарел или клиент остановлен',
+        delivered ? S.captchaAcceptedLog(reason) : S.captchaRejectedLog(reason),
       );
       try {
         webview?.close();
@@ -88,16 +86,16 @@ class CaptchaService {
     try {
       webview = await WebviewWindow.create(
         configuration: CreateConfiguration(
-          title: 'Подтвердите, что вы не робот',
+          title: S.captchaWindowTitle,
           titleBarHeight: 0,
           windowWidth: 420,
           windowHeight: 620,
-          userDataFolderWindows: 'vk_captcha_data',
+          userDataFolderWindows: webviewDataDir('vk_captcha_data'),
         ),
       );
 
       webview.onClose.then((_) {
-        finish('error:closed', 'окно закрыто пользователем');
+        finish('error:closed', S.captchaReasonClosed);
       });
 
       webview.launch(redirectUri);
@@ -113,19 +111,18 @@ class CaptchaService {
           if (capture == null || capture.isEmpty) return;
           final match = _successTokenRegex.firstMatch(capture);
           if (match != null) {
-            await finish(match.group(1)!, 'success_token перехвачен');
+            await finish(match.group(1)!, S.captchaReasonCaptured);
           }
-        } catch (_) {
-        }
+        } catch (_) {}
       });
 
       Timer(timeout, () {
-        finish('error:timeout', 'таймаут ${timeout.inSeconds}s');
+        finish('error:timeout', S.captchaReasonTimeout(timeout.inSeconds));
       });
       return done.future;
     } catch (error) {
-      log('[КАПЧА] Не удалось открыть WebView: $error');
-      await finish('error:webview', 'ошибка WebView');
+      log(S.captchaOpenFailed(error));
+      await finish('error:webview', S.captchaReasonWebview);
     }
   }
 }

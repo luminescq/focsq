@@ -364,8 +364,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   AppClientConfig dco_decode_app_client_config(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 20)
-      throw Exception('unexpected arr length: expect 20 but see ${arr.length}');
+    if (arr.length != 28)
+      throw Exception('unexpected arr length: expect 28 but see ${arr.length}');
     return AppClientConfig(
       turn: dco_decode_String(arr[0]),
       port: dco_decode_String(arr[1]),
@@ -387,6 +387,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       tunUds: dco_decode_String(arr[17]),
       validateVkHashes: dco_decode_bool(arr[18]),
       vkJsToken: dco_decode_String(arr[19]),
+      domainRouting: dco_decode_bool(arr[20]),
+      excludeRuZones: dco_decode_bool(arr[21]),
+      templateDomains: dco_decode_bool(arr[22]),
+      domainWhitelist: dco_decode_bool(arr[23]),
+      directDomains: dco_decode_String(arr[24]),
+      ipRouting: dco_decode_bool(arr[25]),
+      ipWhitelist: dco_decode_bool(arr[26]),
+      directIps: dco_decode_String(arr[27]),
     );
   }
 
@@ -477,6 +485,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_tunUds = sse_decode_String(deserializer);
     var var_validateVkHashes = sse_decode_bool(deserializer);
     var var_vkJsToken = sse_decode_String(deserializer);
+    var var_domainRouting = sse_decode_bool(deserializer);
+    var var_excludeRuZones = sse_decode_bool(deserializer);
+    var var_templateDomains = sse_decode_bool(deserializer);
+    var var_domainWhitelist = sse_decode_bool(deserializer);
+    var var_directDomains = sse_decode_String(deserializer);
+    var var_ipRouting = sse_decode_bool(deserializer);
+    var var_ipWhitelist = sse_decode_bool(deserializer);
+    var var_directIps = sse_decode_String(deserializer);
     return AppClientConfig(
       turn: var_turn,
       port: var_port,
@@ -498,6 +514,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       tunUds: var_tunUds,
       validateVkHashes: var_validateVkHashes,
       vkJsToken: var_vkJsToken,
+      domainRouting: var_domainRouting,
+      excludeRuZones: var_excludeRuZones,
+      templateDomains: var_templateDomains,
+      domainWhitelist: var_domainWhitelist,
+      directDomains: var_directDomains,
+      ipRouting: var_ipRouting,
+      ipWhitelist: var_ipWhitelist,
+      directIps: var_directIps,
     );
   }
 
@@ -609,6 +633,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_String(self.tunUds, serializer);
     sse_encode_bool(self.validateVkHashes, serializer);
     sse_encode_String(self.vkJsToken, serializer);
+    sse_encode_bool(self.domainRouting, serializer);
+    sse_encode_bool(self.excludeRuZones, serializer);
+    sse_encode_bool(self.templateDomains, serializer);
+    sse_encode_bool(self.domainWhitelist, serializer);
+    sse_encode_String(self.directDomains, serializer);
+    sse_encode_bool(self.ipRouting, serializer);
+    sse_encode_bool(self.ipWhitelist, serializer);
+    sse_encode_String(self.directIps, serializer);
   }
 
   @protected
